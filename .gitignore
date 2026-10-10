@@ -1,0 +1,74 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Build / packaging ---
+build/
+dist/
+sdist/
+wheels/
+
+# --- Tests / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+
+# --- Local docs (specs, drafts) ---
+docs/
+
+# --- Secrets ---
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+secrets.json
+.encryption_key
+.encryption_salt
+
+# --- Launcher runtime data ---
+# Anchored with "/" on purpose: these must only match at the repository root,
+# so src/assets/ (QSS + SVG sources) stays tracked.
+/auth.json
+/config.json
+/versions/
+/libraries/
+/assets/
+/runtime/
+/icons/
+/logs/
+/natives/
+*.log
+
+# --- IDE / editors ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
