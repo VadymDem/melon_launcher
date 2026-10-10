@@ -18,6 +18,34 @@ from core.builtin_manifests import (
     get_builtin_profiles, is_builtin_profile,
     VANILLA_1_20_4_MANIFEST, FABRIC_1_20_4_MANIFEST, FORGE_1_20_4_MANIFEST
 )
+from core.official_versions import (
+    OfficialVersion,
+    get_official_releases,
+    get_required_java_version,
+    build_vanilla_manifest,
+    is_official_version,
+    get_install_stats,
+    is_version_installed,
+    get_installed_stats,
+    get_installed_size,
+    delete_installed_version
+)
+from core.packs import (
+    InstalledPack,
+    get_installed_packs,
+    get_pack,
+    version_sort_key,
+)
+from core.instances import (
+    instances_root,
+    get_instance_dir,
+    ensure_instance_dir,
+    instance_exists,
+    is_instance_empty,
+    remove_empty_instance,
+    list_instances,
+    safe_folder_name,
+)
 
 __all__ = [
     "Manifest",
@@ -61,4 +89,26 @@ __all__ = [
     "VANILLA_1_20_4_MANIFEST",
     "FABRIC_1_20_4_MANIFEST",
     "FORGE_1_20_4_MANIFEST",
+    "OfficialVersion",
+    "get_official_releases",
+    "get_required_java_version",
+    "build_vanilla_manifest",
+    "is_official_version",
+    "get_install_stats",
+    "is_version_installed",
+    "get_installed_stats",
+    "get_installed_size",
+    "delete_installed_version",
+    "InstalledPack",
+    "get_installed_packs",
+    "get_pack",
+    "version_sort_key",
+    "instances_root",
+    "get_instance_dir",
+    "ensure_instance_dir",
+    "instance_exists",
+    "is_instance_empty",
+    "remove_empty_instance",
+    "list_instances",
+    "safe_folder_name",
 ]

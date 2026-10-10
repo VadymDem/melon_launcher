@@ -2,26 +2,142 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QLabel, QPushButton, QFrame, QProgressBar,
     QSizePolicy, QMessageBox, QApplication, QTextEdit, QSplitter,
-    QCheckBox, QLineEdit
+    QCheckBox, QLineEdit, QInputDialog, QStackedWidget
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from typing import Callable, List, Optional
 from PyQt6.QtGui import QIcon, QPixmap, QFont, QTextCursor
 
 from ui.settings_dialog import SettingsDialog
+from ui.sidebar import Sidebar
+from ui.home_page import HomePage
+from ui.console_page import ConsolePage
+from ui.placeholder_page import PlaceholderPage
+from ui.versions_page import VersionsPage
 from ui.profile_widget import ProfileWidget
-from ui.build_info_widget import BuildInfoWidget
+from ui.build_info_widget import BuildInfoWidget  # noqa: F401  (kept for settings dialog)
 from utils.config import Config
 from core import (
     ManifestManager, FileChecker, DownloadWorker, Manifest,
-    AuthManager, AuthProfile,
+    AuthManager, AuthProfile, OfflineAuthError,
     JavaManager, JavaInstallation, JVMConfigBuilder,
     LaunchManager, LaunchConfig, GameProcessHandler,
     parse_jvm_args, IconManager,
-    get_builtin_manifest, get_builtin_profiles, is_builtin_profile
+    get_builtin_manifest, get_builtin_profiles, is_builtin_profile,
+    get_official_releases, build_vanilla_manifest, get_required_java_version,
+    get_install_stats, delete_installed_version, get_installed_size,
+    get_installed_packs, get_pack, is_version_installed,
+    ensure_instance_dir, get_instance_dir, remove_empty_instance, instance_exists
 )
 from pathlib import Path
+from datetime import datetime
 import os
+
+
+SOURCE_JAVA = "Java-Edition"
+SOURCE_CUSTOM = "Custom-Modpack (GitHub)"
+SOURCE_CURSEFORGE = "CurseForge"
+SOURCE_MODRINTH = "Modrinth"
+
+PROFILE_CATEGORIES = [
+    SOURCE_JAVA,
+    SOURCE_CUSTOM,
+    SOURCE_CURSEFORGE,
+    SOURCE_MODRINTH,
+]
+
+
+class StatsThread(QThread):
+    """Background thread that computes the install size of a version."""
+
+    ready = pyqtSignal(str, int, int)  # version, file_count, size_bytes
+
+    def __init__(self, version: str):
+        super().__init__()
+        self.version = version
+
+    def run(self):
+        try:
+            stats = get_install_stats(self.version)
+            self.ready.emit(
+                self.version,
+                int(stats.get("files", 0)),
+                int(stats.get("size", 0)),
+            )
+        except Exception:
+            self.ready.emit(self.version, 0, 0)
+
+
+class InstallThread(QThread):
+    """Background thread that installs an official Minecraft version."""
+
+    progress_changed = pyqtSignal(int, int, str)  # value, maximum, status
+
+    # The library reports English status strings; map the common ones.
+    STATUS_RU = {
+        "Download Libraries": "Загрузка библиотек",
+        "Download Assets": "Загрузка ресурсов",
+        "Download client.jar": "Загрузка client.jar",
+        "Download version json": "Загрузка информации о версии",
+    }
+
+    def __init__(self, version: str, minecraft_directory: Path):
+        super().__init__()
+        self.version = version
+        self.minecraft_directory = minecraft_directory
+
+    def run(self):
+        import minecraft_launcher_lib.install as mcl_install
+
+        # The library tracks item counts, not bytes.
+        state = {"current": 0, "maximum": 0}
+
+        def emit(status: str = ""):
+            self.progress_changed.emit(state["current"], state["maximum"], status)
+
+        def set_max(value):
+            state["maximum"] = int(value)
+            emit()
+
+        def set_progress(value):
+            state["current"] = int(value)
+            emit()
+
+        def set_status(message):
+            message = str(message)
+            emit(self.STATUS_RU.get(message, message))
+
+        callback = {
+            "setMax": set_max,
+            "setProgress": set_progress,
+            "setStatus": set_status,
+        }
+
+        try:
+            mcl_install.install_minecraft_version(
+                self.version, str(self.minecraft_directory), callback
+            )
+            self.finished.emit(True, f"Minecraft {self.version} установлен")
+        except Exception as e:
+            self.finished.emit(False, f"Ошибка установки: {e}")
+
+
+class DeleteThread(QThread):
+    """Removes an installed version folder from disk."""
+
+    finished = pyqtSignal(str, bool, str)  # version, success, message
+
+    def __init__(self, version: str, minecraft_directory: Path):
+        super().__init__()
+        self.version = version
+        self.minecraft_directory = minecraft_directory
+
+    def run(self):
+        try:
+            freed = delete_installed_version(self.minecraft_directory, self.version)
+            self.finished.emit(self.version, True, str(freed))
+        except Exception as e:
+            self.finished.emit(self.version, False, str(e))
 
 
 class LaunchThread(QThread):
@@ -41,7 +157,8 @@ class LaunchThread(QThread):
         jvm_args: List[str],
         custom_args: List[str],
         on_progress: Callable[[int, str], None],
-        on_finished: Callable[[bool, str], None]
+        on_finished: Callable[[bool, str], None],
+        minecraft_directory: Path = None
     ):
         super().__init__()
         self.launch_manager = launch_manager
@@ -49,6 +166,7 @@ class LaunchThread(QThread):
         self.manifest = manifest
         self.auth_profile = auth_profile
         self.game_directory = game_directory
+        self.minecraft_directory = minecraft_directory or game_directory
         self.java_version = java_version
         self.jvm_args = jvm_args
         self.custom_args = custom_args
@@ -78,7 +196,8 @@ class LaunchThread(QThread):
                 auth_profile=self.auth_profile,
                 game_directory=self.game_directory,
                 jvm_args=self.jvm_args,
-                custom_args=self.custom_args
+                custom_args=self.custom_args,
+                minecraft_directory=self.minecraft_directory
             )
             
             # Validate
@@ -89,7 +208,10 @@ class LaunchThread(QThread):
             
             # 4. Build command
             self.progress_changed.emit(60, "Сборка команды запуска...")
-            command = self.launch_manager.build_command(launch_config)
+            if self.auth_profile and self.auth_profile.auth_type == "offline":
+                command = self.launch_manager.build_offline_command(launch_config)
+            else:
+                command = self.launch_manager.build_command(launch_config)
             
             self.progress_changed.emit(80, "Запуск процесса игры...")
             
@@ -109,6 +231,13 @@ class LaunchThread(QThread):
 class MainWindow(QMainWindow):
     # Signal for thread-safe auth completion
     auth_completed = pyqtSignal(bool, str, object)  # success, message, profile
+
+    # Game process events - emitted from the background monitor thread and
+    # delivered to the GUI thread as queued connections.
+    game_output = pyqtSignal(str)
+    game_started = pyqtSignal(int)
+    game_exited = pyqtSignal(int)
+    game_crashed = pyqtSignal(int, str)
 
     def __init__(self, config: Config):
         super().__init__()
@@ -133,154 +262,241 @@ class MainWindow(QMainWindow):
         # Connect thread-safe auth completion signal
         self.auth_completed.connect(self._on_auth_completed)
 
+        # Game events must run on the GUI thread
+        self.game_output.connect(self._append_log)
+        self.game_started.connect(self._on_game_started)
+        self.game_exited.connect(self._on_game_exit)
+        self.game_crashed.connect(self._on_game_crash)
+
         # Initialize JavaManager
         self.java_manager = JavaManager(Path(config.install_path))
 
         self.manifest_manager = ManifestManager()
         self.current_manifest: Manifest | None = None
         self.download_worker: DownloadWorker | None = None
+        self.install_thread: InstallThread | None = None
+        self.delete_thread: DeleteThread | None = None
+        self._stats_thread: StatsThread | None = None
+
+        self._packs: List = []
 
         self._setup_ui()
         self._apply_styles()
-        self._load_profiles()
         self._update_profile_widget()
+        self._refresh_home_page()
+        self._refresh_packs()
+        self._update_last_launch_hero()
+        self._refresh_recent_items()
+        QTimer.singleShot(0, self._load_official_versions)
+
+    def _refresh_recent_items(self):
+        """Fill the 'Недавно' row from the installed packs."""
+        packs = get_installed_packs(self.config.install_path)
+
+        items = [
+            ("cube", pack.display_name, f"{pack.loader} · {pack.size_mb:.0f} МБ")
+            for pack in packs[:3]
+        ]
+        self.home_page.set_recent_items(items)
+
+    def _refresh_home_page(self):
+        """Sync account card, RAM and hero with the current state."""
+        profile = self.auth_manager.get_profile()
+        username = profile.username if profile else (self.config.username or "MelonBiba")
+        status = "Офлайн режим" if (profile and profile.auth_type == "offline") else \
+                 ("Microsoft" if profile else "Не вошли в систему")
+
+        initials = "".join(part[0] for part in username.split()[:2]).upper() or "ME"
+        self.sidebar.set_account(username, status, initials)
+        self.sidebar.set_login_text(
+            "Выйти" if profile and profile.auth_type == "microsoft" else "Войти (Microsoft)"
+        )
+
+        if profile:
+            self.page_subtitle.setText(f"С возвращением, {profile.username}")
+        else:
+            self.page_subtitle.setText("С возвращением")
+
+    def _update_java_badge(self):
+        required = getattr(self.current_manifest, "java_version", 21) if self.current_manifest else 21
+        install = self.java_manager.check_java_installed(required)
+        if install and install.is_valid:
+            self.java_badge.setText(f"Java {required} найдена")
+        else:
+            self.java_badge.setText(f"Java {required} не найдена")
 
     def _setup_ui(self):
         central = QWidget()
+        central.setObjectName("root")
         self.setCentralWidget(central)
 
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(24, 24, 24, 24)
-        main_layout.setSpacing(16)
+        root_layout = QHBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        # Header
-        header = self._create_header()
-        main_layout.addLayout(header)
+        # --- Left sidebar ---
+        self.sidebar = Sidebar()
+        self.sidebar.page_requested.connect(self._on_page_requested)
+        self.sidebar.settings_requested.connect(self._open_settings)
+        self.sidebar.login_button.clicked.connect(self._on_account_button)
+        root_layout.addWidget(self.sidebar)
 
-        # Separator
-        sep = QFrame()
-        sep.setObjectName("separator")
-        sep.setFrameShape(QFrame.Shape.HLine)
-        main_layout.addWidget(sep)
+        # --- Right content area ---
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(32, 28, 32, 24)
+        content_layout.setSpacing(22)
 
-        # Content area - use splitter for log panel
-        self.main_splitter = QSplitter(Qt.Orientation.Vertical)
-        main_layout.addWidget(self.main_splitter, 1)
+        content_layout.addLayout(self._create_header())
 
-        # Upper content area
-        upper_widget = QWidget()
-        upper_layout = QHBoxLayout(upper_widget)
-        upper_layout.setContentsMargins(0, 0, 0, 0)
-        upper_layout.setSpacing(24)
-
-        # Left panel - Profile selector + Build info
-        left_panel = QVBoxLayout()
-        left_panel.setSpacing(16)
-        upper_layout.addLayout(left_panel, 2)
-
-        # Profile selector
-        self.profile_combo = QComboBox()
-        self.profile_combo.setPlaceholderText("Выберите сборку...")
-        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
-        left_panel.addWidget(self.profile_combo)
-
-        # Build info widget
-        self.build_info = BuildInfoWidget(self.icon_manager)
-        left_panel.addWidget(self.build_info)
-
-        # Progress bar (hidden by default)
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%p% - %v/%m MB")
-        left_panel.addWidget(self.progress_bar)
+        self.progress_bar.setFormat("%p% - %v/%m файлов")
+        content_layout.addWidget(self.progress_bar)
 
-        # Status label
         self.status_label = QLabel("")
         self.status_label.setObjectName("infoLabel")
         self.status_label.setVisible(False)
         self.status_label.setWordWrap(True)
-        left_panel.addWidget(self.status_label)
+        content_layout.addWidget(self.status_label)
 
-        # Play/Download button
-        self.play_button = QPushButton("Скачать и играть")
-        self.play_button.setMinimumHeight(56)
-        self.play_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.play_button.clicked.connect(self._on_play_clicked)
-        left_panel.addWidget(self.play_button)
+        # Page stack
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("pageStack")
+        content_layout.addWidget(self.stack, 1)
 
-        left_panel.addStretch()
+        self.home_page = HomePage()
+        self.home_page.play_requested.connect(self._on_play_clicked)
+        self.home_page.version_changed.connect(self._on_home_pack_changed)
+        self.home_page.browse_versions_requested.connect(self._go_to_versions_page)
+        self.stack.addWidget(self.home_page)
 
-        # Right panel - User profile
-        right_panel = QVBoxLayout()
-        right_panel.setSpacing(16)
-        upper_layout.addLayout(right_panel, 1)
+        self.versions_page = VersionsPage(self.config)
+        self.versions_page.load_requested.connect(self._on_version_load_requested)
+        self.versions_page.play_requested.connect(self._on_version_play_requested)
+        self.versions_page.delete_requested.connect(self._on_version_delete_requested)
+        self.versions_page.launch_options_requested.connect(self._open_settings)
+        self.versions_page.open_folder_requested.connect(self._open_instance_folder)
+        self.stack.addWidget(self.versions_page)
 
-        self.profile_widget = ProfileWidget(self.config, self.auth_manager)
-        self.profile_widget.microsoft_login_requested.connect(self._start_microsoft_login)
-        right_panel.addWidget(self.profile_widget)
+        self.stack.addWidget(PlaceholderPage("Сборки", "builds"))
+        self.stack.addWidget(PlaceholderPage("Миры", "worlds"))
+        self.stack.addWidget(PlaceholderPage("Серверы", "servers"))
 
-        right_panel.addStretch()
+        self.console_page = ConsolePage()
+        self.console_page.clear_requested.connect(self._clear_log)
+        self.stack.addWidget(self.console_page)
 
-        self.main_splitter.addWidget(upper_widget)
+        root_layout.addWidget(content, 1)
 
-        # Log console panel (bottom)
+        # Log console lives inside its own page now
         self._setup_log_console()
-        self.main_splitter.addWidget(self.log_console_widget)
-        self.main_splitter.setSizes([500, 150])  # Initial sizes
-        self.main_splitter.setCollapsible(1, True)
+        self.console_page.set_console_widget(self.log_console_widget)
+        self.console_page.set_empty(True)
+        # Header is hidden while the console page is open
+        self.page_title.setVisible(True)
+        self.page_subtitle.setVisible(True)
 
-        # Bottom bar - Settings button
-        bottom_bar = QHBoxLayout()
-        bottom_bar.addStretch()
-        settings_btn = QPushButton("Настройки")
-        settings_btn.setObjectName("secondaryButton")
-        settings_btn.setFixedWidth(140)
-        settings_btn.clicked.connect(self._open_settings)
-        bottom_bar.addWidget(settings_btn)
-        main_layout.addLayout(bottom_bar)
+        # Keep legacy widgets referenced by existing logic
+        self.play_button = self.home_page.play_button
+        self.profile_combo = self.home_page.version_combo
+        self.profile_widget = ProfileWidget(self.config, self.auth_manager)
+        self.main_splitter = QSplitter(Qt.Orientation.Vertical)
 
     def _create_header(self):
         header = QHBoxLayout()
         header.setSpacing(16)
 
-        # App title
-        title = QLabel("Melon Launcher")
-        title.setObjectName("titleLabel")
-        header.addWidget(title)
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
 
+        self.page_title = QLabel("Главная")
+        self.page_title.setObjectName("pageTitle")
+        titles.addWidget(self.page_title)
+
+        self.page_subtitle = QLabel("С возвращением")
+        self.page_subtitle.setObjectName("pageSubtitle")
+        titles.addWidget(self.page_subtitle)
+
+        header.addLayout(titles)
         header.addStretch()
 
-        # Version label (placeholder)
-        version = QLabel("v0.1.0-dev")
-        version.setObjectName("versionLabel")
-        header.addWidget(version)
+        # Java status badge
+        badge = QFrame()
+        badge.setObjectName("javaBadge")
+        badge_layout = QHBoxLayout(badge)
+        badge_layout.setContentsMargins(16, 8, 16, 8)
+        badge_layout.setSpacing(8)
 
+        dot = QLabel("●")
+        dot.setStyleSheet("color: #a6e3a1; font-size: 12px;")
+        badge_layout.addWidget(dot)
+
+        self.java_badge = QLabel("Java 21 найдена")
+        self.java_badge.setObjectName("javaBadgeText")
+        badge_layout.addWidget(self.java_badge)
+
+        header.addWidget(badge)
         return header
 
+    def _on_page_requested(self, key: str):
+        pages = {
+            "home": 0, "versions": 1, "builds": 2,
+            "worlds": 3, "servers": 4, "console": 5,
+        }
+        titles = {
+            "home": ("Главная", "С возвращением"),
+            "versions": ("Версии", "Официальные версии Minecraft"),
+            "builds": ("Сборки", "Модпаки и сборки"),
+            "worlds": ("Миры", "Ваши миры"),
+            "servers": ("Серверы", "Список серверов"),
+            "console": ("Консоль", "Вывод игры и лаунчера"),
+        }
+        index = pages.get(key, 0)
+        self.stack.setCurrentIndex(index)
+        title, subtitle = titles.get(key, ("", ""))
+        self.page_title.setText(title)
+        self.page_subtitle.setText(subtitle)
+
+        # The console fills the page, so hide the shared header widgets
+        is_console = (key == "console")
+        self.page_title.setVisible(not is_console)
+        self.page_subtitle.setVisible(not is_console)
+
+    def _on_account_button(self):
+        if self.profile_widget is None:
+            return
+        self.profile_widget._on_auth_clicked()
+
+    def _open_instance_folder(self, pack_id: str):
+        """Open the per-instance game folder of a pack in the file manager."""
+        if not pack_id:
+            return
+
+        try:
+            instance = ensure_instance_dir(Path(self.config.install_path), pack_id)
+        except ValueError as e:
+            QMessageBox.warning(self, "Ошибка", str(e))
+            return
+
+        try:
+            os.startfile(str(instance))
+        except Exception as e:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось открыть папку: {e}")
+
     def _setup_log_console(self):
-        """Setup the game log console panel."""
+        """Create the log console widget (hosted by the Console page)."""
         self.log_console_widget = QWidget()
         log_layout = QVBoxLayout(self.log_console_widget)
         log_layout.setContentsMargins(0, 0, 0, 0)
         log_layout.setSpacing(8)
 
-        # Log header
-        log_header = QHBoxLayout()
-        log_header.addWidget(QLabel("Консоль игры"))
-        log_header.addStretch()
-
-        self.log_clear_btn = QPushButton("Очистить")
-        self.log_clear_btn.setObjectName("secondaryButton")
-        self.log_clear_btn.setFixedWidth(80)
-        self.log_clear_btn.clicked.connect(self._clear_log)
-        log_header.addWidget(self.log_clear_btn)
-
         self.log_auto_scroll = QCheckBox("Автопрокрутка")
+        self.log_auto_scroll.setObjectName("consoleAutoScroll")
         self.log_auto_scroll.setChecked(True)
-        log_header.addWidget(self.log_auto_scroll)
-
-        log_layout.addLayout(log_header)
+        self.log_auto_scroll.setVisible(False)  # kept for _append_log compatibility
+        log_layout.addWidget(self.log_auto_scroll)
 
         # Log text area
         self.log_console = QTextEdit()
@@ -297,16 +513,19 @@ class MainWindow(QMainWindow):
         """)
         log_layout.addWidget(self.log_console, 1)
 
-        # Initially hidden
-        self.log_console_widget.setVisible(False)
-
     def _clear_log(self):
         """Clear the log console."""
         self.log_console.clear()
+        self.console_page.set_empty(True)
 
     def _append_log(self, message: str):
-        """Append a message to the log console."""
-        # Add timestamp
+        """Append a message to the log console (must run on the GUI thread)."""
+        # Guard: if a background thread calls this directly, re-dispatch it
+        # through the signal so Qt delivers it on the GUI thread.
+        if QThread.currentThread() is not self.thread():
+            self.game_output.emit(message)
+            return
+
         from datetime import datetime
         timestamp = datetime.now().strftime("%H:%M:%S")
         formatted = f"[{timestamp}] {message}"
@@ -321,9 +540,12 @@ class MainWindow(QMainWindow):
         
         # Use HTML for colors
         self.log_console.append(f'<span style="color: {color};">{formatted}</span>')
-        
+
+        if self.log_console.document().characterCount() > 1:
+            self.console_page.set_empty(False)
+
         # Auto scroll
-        if self.log_auto_scroll.isChecked():
+        if self.console_page.auto_scroll.isChecked():
             scrollbar = self.log_console.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
 
@@ -332,109 +554,397 @@ class MainWindow(QMainWindow):
         qss_path = Path(__file__).parent.parent / "assets" / "style.qss"
         if qss_path.exists():
             with open(qss_path, "r", encoding="utf-8") as f:
-                self.setStyleSheet(f.read())
+                qss = f.read()
+            # url(assets/...) in the QSS is resolved against the current working
+            # directory; make it absolute so icons work wherever the app is started.
+            qss = qss.replace("url(assets/", f"url({qss_path.parent.as_posix()}/")
+            self.setStyleSheet(qss)
 
-    def _load_profiles(self):
-        # Built-in profiles
-        profiles = get_builtin_profiles() + ["Custom Build"]
-        self.profile_combo.addItems(profiles)
-        if self.config.last_profile:
-            idx = self.profile_combo.findText(self.config.last_profile)
-            if idx >= 0:
-                self.profile_combo.setCurrentIndex(idx)
+    def _load_official_versions(self):
+        """
+        Fetch the official release list from Mojang.
 
-    def _on_profile_changed(self, profile_name: str):
-        self.config.last_profile = profile_name
-        self.config.save()
-        self.build_info.update_build(profile_name)
-        self._load_manifest_for_profile(profile_name)
-        self._update_play_button(profile_name)
-
-    def _load_manifest_for_profile(self, profile_name: str):
-        # For built-in profiles, use real manifest
-        if is_builtin_profile(profile_name):
-            self.current_manifest = get_builtin_manifest(profile_name)
-            self.build_info.update_build_from_manifest(self.current_manifest)
-            self._hide_progress()
+        The list only feeds the "Версии" page, which is the single place where
+        official versions can be installed. The home page shows installed
+        packs instead (see _refresh_packs).
+        """
+        try:
+            versions = get_official_releases()
+        except Exception as e:
+            self.status_label.setText(f"Ошибка загрузки списка версий: {e}")
+            self.status_label.setVisible(True)
+            self._refresh_packs()
             return
 
-        # For Custom Build, try to fetch from manifest URL
-        if profile_name == "Custom Build" and self.config.manifest_url:
-            self._show_progress(0, "Загрузка манифеста...")
-            QTimer.singleShot(0, lambda: self._fetch_manifest_async(self.config.manifest_url))
-        else:
-            self.current_manifest = None
-            self._hide_progress()
+        if hasattr(self, "versions_page"):
+            self.versions_page.set_versions(versions)
 
-    def _fetch_manifest_async(self, url: str):
+        self._refresh_packs()
+
+    def _refresh_packs(self):
+        """
+        Fill the home quick selection with the installed packs.
+
+        Also restores the previously selected pack when it is still installed.
+        """
+        packs = get_installed_packs(self.config.install_path)
+        self._packs = packs
+
+        self.home_page.set_packs(packs)
+
+        if not packs:
+            self.current_manifest = None
+            self.home_page.set_play_enabled(False)
+            self.home_page.set_summary(
+                "Официальные версии устанавливаются во вкладке «Версии»"
+            )
+            self._update_last_launch_hero()
+            return
+
+        index = 0
+        wanted = self.config.last_pack
+        for position, pack in enumerate(packs):
+            if pack.id == wanted:
+                index = position
+                break
+
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.setCurrentIndex(index)
+        self.profile_combo.blockSignals(False)
+
+        self.home_page.set_play_enabled(True)
+        self._select_pack(packs[index].id)
+
+    def _on_home_pack_changed(self, display_name: str):
+        """The quick selection combo shows "Minecraft <id>" labels."""
+        if not display_name:
+            return
+
+        pack_id = display_name.replace("Minecraft ", "", 1)
+        self._select_pack(pack_id)
+
+    def _select_pack(self, pack_id: str):
+        """Select a pack by id and refresh everything that depends on it."""
+        if not pack_id:
+            return
+
+        self.config.last_pack = pack_id
+        self.config.last_profile = pack_id
+        self.config.save()
+
+        self.current_manifest = build_vanilla_manifest(pack_id)
+        self._update_home_hero()
+        self._update_play_button(pack_id)
+        self._update_java_badge()
+
+    def _go_to_versions_page(self):
+        self.sidebar.set_active("versions")
+        self._on_page_requested("versions")
+
+    def _update_home_hero(self):
+        """
+        Hero card + quick selection summary for the selected pack.
+
+        The pack is already installed at this point, so its file count and size
+        are read from disk instead of the (empty) manifest file list.
+        """
+        pack = self._selected_pack()
+        if not pack:
+            return
+
+        profile = self.auth_manager.get_profile()
+        auth_label = "Offline" if (profile and profile.auth_type == "offline") else "Microsoft"
+
+        played = self._format_last_played(self.config.last_pack_time)
+
+        self.home_page.set_hero(
+            title=pack.display_name,
+            description=(
+                f"Готова к запуску · {pack.file_count} файлов · "
+                f"{pack.size_mb:.1f} МБ"
+                + (f" · {played}" if played else "")
+            ),
+            loader=pack.loader,
+            java=f"Java {pack.java_version}",
+            auth=auth_label,
+        )
+        self.home_page.set_hero_tags_visible(True)
+
+        self.home_page.set_summary(
+            f"Тип: {pack.loader} · Файлов: {pack.file_count} · "
+            f"Размер: {pack.size_mb:.1f} МБ"
+        )
+
+    def _update_last_launch_hero(self):
+        """
+        Hero card content for the "Последний запуск" section.
+
+        Shows the pack launched last; when nothing was ever played the card
+        falls back to a friendly invitation instead of stale data.
+        """
+        pack = get_pack(self.config.install_path, self.config.last_pack) \
+            if self.config.last_pack else None
+
+        if not pack:
+            self.home_page.set_hero(
+                title="Melon Launcher",
+                description="Вы давно не заходили в свой мир, сыграем?",
+                loader="Vanilla",
+                java="",
+                auth="",
+            )
+            self.home_page.set_hero_tags_visible(False)
+            return
+
+        played = self._format_last_played(self.config.last_pack_time)
+        profile = self.auth_manager.get_profile()
+        auth_label = "Offline" if (profile and profile.auth_type == "offline") else "Microsoft"
+
+        self.home_page.set_hero(
+            title=pack.display_name,
+            description=(
+                f"Последний запуск{': ' + played if played else ''} · "
+                f"Java {pack.java_version} · {pack.size_mb:.1f} МБ"
+            ),
+            loader=pack.loader,
+            java=f"Java {pack.java_version}",
+            auth=auth_label,
+        )
+        self.home_page.set_hero_tags_visible(True)
+
+    def _selected_pack(self):
+        """The pack currently chosen in the quick selection combo."""
+        return get_pack(self.config.install_path, self.config.last_pack) \
+            if self.config.last_pack else None
+
+    @staticmethod
+    def _format_last_played(raw: str) -> str:
+        """Human readable "when was this played last" text."""
+        if not raw:
+            return ""
+
         try:
-            manifest = self.manifest_manager.fetch_manifest(url)
-            self.current_manifest = manifest
-            self.build_info.update_build_from_manifest(manifest)
-            self._hide_progress()
-            self._update_play_button(self.profile_combo.currentText())
-        except Exception as e:
-            self._hide_progress()
-            self.status_label.setText(f"Ошибка загрузки манифеста: {e}")
-            self.status_label.setVisible(True)
-            self.current_manifest = None
-            self._update_play_button(self.profile_combo.currentText())
+            moment = datetime.fromisoformat(raw)
+        except ValueError:
+            return ""
 
-    def _update_play_button(self, profile_name: str):
-        if profile_name == "Custom Build":
-            if self.current_manifest is None:
-                if self.config.manifest_url:
-                    self.play_button.setText("Ошибка манифеста")
-                    self.play_button.setEnabled(False)
-                else:
-                    self.play_button.setText("Настройте URL манифеста")
-                    self.play_button.setEnabled(False)
-            else:
-                # Check if installed
-                if self._is_installed():
-                    self.play_button.setText("Играть")
-                else:
-                    total_mb = self.current_manifest.get_total_size() / (1024 * 1024)
-                    self.play_button.setText(f"Скачать ({total_mb:.0f} MB) и играть")
-                self.play_button.setEnabled(True)
-        else:
-            # Built-in profiles - use real manifest
-            if self.current_manifest and is_builtin_profile(profile_name):
-                if self._is_installed():
-                    self.play_button.setText("Играть")
-                else:
-                    total_mb = self.current_manifest.get_total_size() / (1024 * 1024)
-                    self.play_button.setText(f"Скачать ({total_mb:.0f} MB) и играть")
-                self.play_button.setEnabled(True)
-            else:
-                self.play_button.setText("Играть")
-                self.play_button.setEnabled(True)
+        delta = datetime.now() - moment.replace(tzinfo=None)
+        seconds = delta.total_seconds()
 
-    def _is_installed(self) -> bool:
-        if not self.current_manifest:
-            return False
-        # Built-in profiles have no files to download
-        if is_builtin_profile(self.profile_combo.currentText()):
-            return True
-        checker = FileChecker(Path(self.config.install_path))
-        to_download = checker.get_files_to_download(self.current_manifest)
-        return len(to_download) == 0
+        if seconds < 60:
+            return "только что"
+        if seconds < 3600:
+            return f"{int(seconds // 60)} мин назад"
+        if seconds < 86400:
+            return f"{int(seconds // 3600)} ч назад"
+        if seconds < 86400 * 7:
+            return f"{int(seconds // 86400)} дн назад"
+        return moment.strftime("%d.%m.%Y")
+
+    def _request_install_stats(self, version: str):
+        """Fetch file count / size for an official version in the background."""
+        if getattr(self, "_stats_thread", None) is not None:
+            if self._stats_thread.isRunning():
+                return
+        self._stats_thread = StatsThread(version)
+        self._stats_thread.ready.connect(self._on_install_stats)
+        self._stats_thread.start()
+
+    def _on_install_stats(self, version: str, files: int, size_bytes: int):
+        """Show the real file count and size once Mojang answered."""
+        manifest = self.current_manifest
+        if not manifest or manifest.minecraft_version != version:
+            return
+
+        size_mb = size_bytes / (1024 * 1024)
+        loader = manifest.loader.type.capitalize() if manifest.loader.type else "Vanilla"
+        self.home_page.set_summary(
+            f"Тип: {loader} · Файлов: {files:,} · Размер: {size_mb:.0f} МБ"
+        )
+
+    def _update_play_button(self, pack_id: str):
+        """
+        The home page only launches packs that are already installed -
+        downloading an official version happens in the "Версии" page.
+        """
+        if not pack_id or not self._is_official_installed(pack_id):
+            self.play_button.setText("Нет сборок")
+            self.play_button.setEnabled(False)
+            self.home_page.set_play_enabled(False)
+            return
+
+        self.home_page.set_play_enabled(True)
+        self.play_button.setText("Играть")
+        self.play_button.setEnabled(True)
+
+    def _is_official_installed(self, mc_version: str) -> bool:
+        """Check whether an official Minecraft version is already installed."""
+        return is_version_installed(self.config.install_path, mc_version)
 
     def _on_play_clicked(self):
-        profile = self.profile_combo.currentText()
+        pack_id = self.config.last_pack
+        if not pack_id or not self._is_official_installed(pack_id):
+            self._offer_versions_page()
+            return
+        self._launch_game()
 
-        if profile == "Custom Build" and self.current_manifest:
-            if self._is_installed():
-                self._launch_game()
-            else:
-                self._start_download()
+    def _offer_versions_page(self):
+        """No pack installed - send the user to the versions page."""
+        answer = QMessageBox.question(
+            self, "Нет установленных сборок",
+            "Пока нет установленных сборок.\n"
+            "Официальные версии устанавливаются во вкладке «Версии».\n\n"
+            "Перейти во вкладку «Версии»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.sidebar.set_active("versions")
+            self._on_page_requested("versions")
+
+    def _start_official_install(self, version: str):
+        """Download and install an official Minecraft version."""
+        self.play_button.setEnabled(False)
+        self.play_button.setText("Загрузка...")
+        self._show_progress(0, f"Подготовка загрузки {version}...")
+
+        self.install_thread = InstallThread(
+            version=version,
+            minecraft_directory=Path(self.config.install_path)
+        )
+        self.install_thread.progress_changed.connect(self._on_install_progress)
+        self.install_thread.finished.connect(self._on_install_finished)
+        self.install_thread.start()
+
+    def _on_install_progress(self, value: int, maximum: int, status: str):
+        self.progress_bar.setVisible(True)
+        if maximum > 0:
+            self.progress_bar.setMaximum(maximum)
+        if value >= 0:
+            self.progress_bar.setValue(value)
+        if status:
+            self.status_label.setText(status)
+            self.status_label.setVisible(True)
+
+    def _on_install_finished(self, success: bool, message: str):
+        self.install_thread = None
+        self._hide_progress()
+
+        if success:
+            self._refresh_packs()
+            self._refresh_recent_items()
+            self._update_play_button(self.config.last_pack)
+            self.versions_page.refresh_installed_states()
+            QMessageBox.information(self, "Успех", message)
         else:
+            self.play_button.setEnabled(True)
+            self.play_button.setText("Повторить загрузку")
+            QMessageBox.critical(self, "Ошибка загрузки", message)
+
+    def _on_version_load_requested(self, version_id: str):
+        """Install an official version selected from the versions page."""
+        if self._is_official_installed(version_id):
             QMessageBox.information(
-                self, "Запуск",
-                f"Запуск сборки: {profile}\n\n(Реализация запуска будет в Этапе 5)"
+                self, "Установка",
+                f"Версия {version_id} уже установлена."
             )
+            return
+        self._start_official_install(version_id)
+
+    def _on_version_play_requested(self, version_id: str):
+        """Play an official version selected from the versions page."""
+        if not self._is_official_installed(version_id):
+            QMessageBox.warning(self, "Ошибка", f"Версия {version_id} не установлена.")
+            return
+
+        # Make it the pack the home page works with, then launch it.
+        index = self.profile_combo.findText(f"Minecraft {version_id}")
+        if index >= 0:
+            self.profile_combo.blockSignals(True)
+            self.profile_combo.setCurrentIndex(index)
+            self.profile_combo.blockSignals(False)
+
+        self._select_pack(version_id)
+        self._launch_game()
+
+    def _on_version_delete_requested(self, version_id: str):
+        """Ask for confirmation, then delete an installed version."""
+        if not self._is_official_installed(version_id):
+            return
+
+        freed_mb = get_installed_size(
+            Path(self.config.install_path), version_id
+        ) / (1024 * 1024)
+
+        if self._is_game_running():
+            QMessageBox.warning(
+                self, "Удаление версии",
+                "Сначала закройте игру, затем удалите версию."
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Удалить версию",
+            f"Удалить Minecraft {version_id}?\n\n"
+            f"Будет освобождено {freed_mb:.1f} МБ.\n"
+            f"Миры, настройки и общие библиотеки останутся.\n\n"
+            f"Версию можно скачать заново.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.delete_thread = DeleteThread(
+            version_id, Path(self.config.install_path)
+        )
+        self.delete_thread.finished.connect(self._on_version_delete_finished)
+        self.delete_thread.start()
+
+    def _on_version_delete_finished(self, version_id: str, success: bool, info: str):
+        self.delete_thread = None
+
+        if not success:
+            QMessageBox.critical(self, "Ошибка удаления", info)
+            return
+
+        # A deleted version must not stay selected or remembered as "last launch".
+        if self.config.last_pack == version_id:
+            self.config.last_pack = ""
+            self.config.last_profile = ""
+            self.config.save()
+
+        self.versions_page.refresh_installed_states()
+        self._refresh_packs()
+        self._refresh_recent_items()
+
+        freed_mb = int(info) / (1024 * 1024)
+        message = f"Версия {version_id} удалена, освобождено {freed_mb:.1f} МБ"
+
+        # The instance folder is only dropped when the player never used it.
+        try:
+            if remove_empty_instance(Path(self.config.install_path), version_id):
+                message += ". Папка сборки удалена"
+            elif instance_exists(Path(self.config.install_path), version_id):
+                message += f". Миры и моды сохранены в папке сборки: {version_id}"
+        except ValueError:
+            pass
+
+        self.status_label.setText(message)
+        self.status_label.setVisible(True)
+
+    def _is_game_running(self) -> bool:
+        handler = getattr(self, "_process_handler", None)
+        if handler is None:
+            return False
+        try:
+            return bool(handler.is_running())
+        except Exception:
+            return False
 
     def _start_download(self):
+        """Download files of a custom modpack manifest (used by builds)."""
         if not self.current_manifest:
             return
 
@@ -467,7 +977,7 @@ class MainWindow(QMainWindow):
         self._hide_progress()
 
         if success:
-            self._update_play_button(self.profile_combo.currentText())
+            self._refresh_packs()
             QMessageBox.information(self, "Успех", message)
         else:
             self.play_button.setEnabled(True)
@@ -490,6 +1000,45 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.status_label.setVisible(False)
 
+    def _offer_offline_login(self) -> Optional[AuthProfile]:
+        """
+        Offer offline play when the user is not signed in.
+        Returns an offline AuthProfile, or None if the user cancelled.
+        """
+        answer = QMessageBox.question(
+            self,
+            "Авторизация",
+            "Вы не вошли в аккаунт Microsoft.\n\n"
+            "Запустить в оффлайн-режиме? Работают одиночная игра и локальные миры.\n"
+            "Realms и онлайн-серверы будут недоступны.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+
+        if answer != QMessageBox.StandardButton.Yes:
+            return None
+
+        default = self.config.username or "Player"
+        username, ok = QInputDialog.getText(
+            self, "Оффлайн-режим", "Введите игровое имя:",
+            QLineEdit.EchoMode.Normal, default
+        )
+        if not ok or not username.strip():
+            return None
+
+        try:
+            profile = self.auth_manager.login_offline(username.strip())
+        except OfflineAuthError as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+            return None
+
+        self.config.username = profile.username
+        self.config.auth_type = "offline"
+        self.config.save()
+        self._update_profile_widget()
+        self._append_log(f"[AUTH] Оффлайн-вход как {profile.username}")
+        return profile
+
     def _launch_game(self):
         """Full game launch implementation using LaunchManager and GameProcessHandler."""
         if not self.current_manifest:
@@ -498,8 +1047,9 @@ class MainWindow(QMainWindow):
 
         profile = self.auth_manager.get_profile()
         if not profile:
-            QMessageBox.warning(self, "Ошибка", "Требуется авторизация")
-            return
+            profile = self._offer_offline_login()
+            if not profile:
+                return
 
         # Determine required Java version from manifest
         required_java = getattr(self.current_manifest, 'java_version', 17)
@@ -510,15 +1060,25 @@ class MainWindow(QMainWindow):
         # Add RAM settings from config
         builder = JVMConfigBuilder.from_config(self.config)
         jvm_args.extend(builder.build_jvm_args())
+
+        # Each pack plays in its own folder so worlds and mods never mix.
+        pack_id = self.current_manifest.minecraft_version
+        install_root = Path(self.config.install_path)
+        try:
+            instance_dir = ensure_instance_dir(install_root, pack_id)
+        except ValueError as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось создать папку сборки: {e}")
+            return
         
-        # Show log console
-        self.log_console_widget.setVisible(True)
-        self.main_splitter.setSizes([450, 200])
+        # Switch to the console tab so the user sees the launch output
+        self.sidebar.set_active("console")
+        self._on_page_requested("console")
         self._clear_log()
         self._append_log("=== Начало запуска ===")
         self._append_log(f"Сборка: {self.current_manifest.name} {self.current_manifest.version}")
         self._append_log(f"Java версия: {required_java}")
         self._append_log(f"Память: {self.config.ram_mb} MB")
+        self._append_log(f"Папка игры: {instance_dir}")
         self._append_log(f"Авторизация: {profile.username} ({profile.auth_type})")
 
         # Disable play button during launch
@@ -528,11 +1088,12 @@ class MainWindow(QMainWindow):
         # Create launch manager
         self._launch_manager = LaunchManager()
         self._process_handler = GameProcessHandler(
-            on_output=self._append_log,
-            on_crash=self._on_game_crash,
-            on_exit=self._on_game_exit,
-            on_started=self._on_game_started,
-            log_file=Path(self.config.install_path) / "logs" / "latest.log"
+            # Emitting signals is thread-safe; the slots run on the GUI thread.
+            on_output=self.game_output.emit,
+            on_crash=self.game_crashed.emit,
+            on_exit=self.game_exited.emit,
+            on_started=self.game_started.emit,
+            log_file=instance_dir / "logs" / "latest.log"
         )
 
         # Start launch sequence in a thread to avoid blocking UI
@@ -541,7 +1102,8 @@ class MainWindow(QMainWindow):
             process_handler=self._process_handler,
             manifest=self.current_manifest,
             auth_profile=profile,
-            game_directory=Path(self.config.install_path),
+            game_directory=instance_dir,
+            minecraft_directory=install_root,
             java_version=required_java,
             jvm_args=jvm_args,
             custom_args=[],
@@ -573,19 +1135,37 @@ class MainWindow(QMainWindow):
         """Handle game process started."""
         self._append_log(f"Процесс игры запущен (PID: {pid})")
 
+        # Remember what was launched - it drives the "Последний запуск" card.
+        if self.current_manifest and self.current_manifest.minecraft_version:
+            self.config.last_pack = self.current_manifest.minecraft_version
+            self.config.last_pack_time = datetime.now().isoformat(timespec="seconds")
+            self.config.save()
+            self._update_home_hero()
+
+    def _reset_after_game_end(self):
+        """Restore the launcher to its idle state after the game ends."""
+        self.play_button.setEnabled(True)
+        self._update_play_button(self.config.last_pack)
+
+        if self._process_handler is not None:
+            self._process_handler = None
+        if self._launch_thread is not None:
+            self._launch_thread = None
+
+        if self.isMinimized():
+            self.showNormal()
+        self.activateWindow()
+
     def _on_game_crash(self, exit_code: int, error_log: str):
         """Handle game crash."""
         self._append_log(f"=== ИГРА УПАЛА (код: {exit_code}) ===")
         self._append_log("Последние ошибки:")
-        for line in error_log.split("\n")[-20:]:
+        for line in (error_log or "").split("\n")[-20:]:
             if line.strip():
                 self._append_log(f"  {line}")
-        
-        # Restore launcher window
-        self.showNormal()
-        self.activateWindow()
-        
-        # Show crash dialog
+
+        self._reset_after_game_end()
+
         QMessageBox.critical(
             self, "Игра упала",
             f"Minecraft завершился с кодом {exit_code}.\n\n"
@@ -593,17 +1173,26 @@ class MainWindow(QMainWindow):
         )
 
     def _on_game_exit(self, exit_code: int):
-        """Handle normal game exit."""
+        """Handle normal game exit (closing the game window, Alt+F4, ...)."""
         self._append_log(f"=== Игра закрыта (код: {exit_code}) ===")
-        
-        # Restore launcher window
-        self.showNormal()
-        self.activateWindow()
+        self._reset_after_game_end()
 
     def closeEvent(self, event):
         if self.download_worker and self.download_worker.isRunning():
             self.download_worker.cancel()
             self.download_worker.wait(3000)
+        if self.install_thread and self.install_thread.isRunning():
+            self.install_thread.terminate()
+            self.install_thread.wait(3000)
+        if self._stats_thread and self._stats_thread.isRunning():
+            self._stats_thread.terminate()
+            self._stats_thread.wait(2000)
+        if self.delete_thread and self.delete_thread.isRunning():
+            self.delete_thread.wait(3000)
+        # The versions page runs its own stats thread; stop it before the
+        # window is destroyed, otherwise Qt aborts on a live QThread.
+        if hasattr(self, "versions_page"):
+            self.versions_page.shutdown()
         # Stop auth callback server
         if hasattr(self, 'auth_manager') and self.auth_manager:
             self.auth_manager.stop_callback_server()
@@ -663,6 +1252,5 @@ class MainWindow(QMainWindow):
         dialog.microsoft_login_requested.connect(self._start_microsoft_login)
         if dialog.exec():
             self._apply_styles()
-            self.profile_combo.clear()
-            self._load_profiles()
+            self._refresh_packs()
             self._update_profile_widget()

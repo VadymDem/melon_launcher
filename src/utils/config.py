@@ -11,6 +11,9 @@ class Config:
     install_path: str = ""
     username: str = "Player"
     last_profile: str = ""
+    # Pack launched most recently - drives the "Последний запуск" hero card.
+    last_pack: str = ""
+    last_pack_time: str = ""
     java_version: int = 17
     custom_jvm_args: str = ""
     # Azure app (client) id used for the Microsoft/Minecraft login.

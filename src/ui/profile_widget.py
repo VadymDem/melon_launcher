@@ -1,6 +1,6 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFrame, QSizePolicy, QMessageBox, QInputDialog, QLineEdit
+    QFrame, QSizePolicy, QMessageBox, QInputDialog, QLineEdit, QComboBox
 )
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QColor, QFont
@@ -72,6 +72,14 @@ class ProfileWidget(QWidget):
         """)
         frame_layout.addWidget(self.auth_badge, alignment=Qt.AlignmentFlag.AlignHCenter)
 
+        # Auth mode switcher
+        self.auth_mode_combo = QComboBox()
+        self.auth_mode_combo.addItems(["Microsoft", "Offline"])
+        self.auth_mode_combo.setToolTip("Режим авторизации")
+        self.auth_mode_combo.setFixedHeight(32)
+        self.auth_mode_combo.currentTextChanged.connect(self._on_auth_mode_changed)
+        frame_layout.addWidget(self.auth_mode_combo)
+
         # Login/Logout button
         self.auth_button = QPushButton("Войти")
         self.auth_button.setObjectName("secondaryButton")
@@ -83,6 +91,13 @@ class ProfileWidget(QWidget):
 
     def _update_profile(self):
         profile = self.auth_manager.get_profile()
+
+        # Keep the mode selector in sync with the active profile
+        mode = "Microsoft" if (profile and profile.auth_type == "microsoft") else "Offline"
+        if self.auth_mode_combo.currentText() != mode:
+            self.auth_mode_combo.blockSignals(True)
+            self.auth_mode_combo.setCurrentText(mode)
+            self.auth_mode_combo.blockSignals(False)
         
         if profile:
             self.username_label.setText(profile.username)
@@ -166,6 +181,24 @@ class ProfileWidget(QWidget):
         painter.end()
 
         self.avatar_label.setPixmap(pixmap)
+
+    def _on_auth_mode_changed(self, mode: str):
+        """Switch between Microsoft and offline authorisation."""
+        profile = self.auth_manager.get_profile()
+
+        if profile:
+            current = "Microsoft" if profile.auth_type == "microsoft" else "Offline"
+            if mode == current:
+                return
+            self.auth_manager.logout()
+            self.config.auth_type = mode.lower()
+            self.config.save()
+            self._update_profile()
+
+        if mode == "Offline":
+            self._start_offline_login()
+        else:
+            self._start_microsoft_login()
 
     def _on_auth_clicked(self):
         profile = self.auth_manager.get_profile()

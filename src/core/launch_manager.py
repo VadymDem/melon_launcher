@@ -4,7 +4,7 @@ import json
 import time
 import threading
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, List, Dict, Any, Callable
 from queue import Queue, Empty
 
@@ -25,10 +25,16 @@ class LaunchConfig:
     game_directory: Path
     jvm_args: List[str]
     custom_args: List[str] = None
+    # Root that holds versions/libraries/assets. Shared by every instance, so
+    # it stays in the install path while game_directory points at the instance.
+    minecraft_directory: Optional[Path] = None
     
     def __post_init__(self):
         if self.custom_args is None:
             self.custom_args = []
+        if self.minecraft_directory is None:
+            # Single-instance setups: the game directory is the install root.
+            self.minecraft_directory = self.game_directory
 
 
 @dataclass
@@ -57,9 +63,13 @@ class LaunchManager:
         """
         self._last_config = config
         
-        # Prepare the game directory
+        # Prepare the per-instance game directory (worlds, mods, options)
         game_dir = config.game_directory
         game_dir.mkdir(parents=True, exist_ok=True)
+
+        # Shared root with versions/libraries/assets
+        mc_dir = config.minecraft_directory or game_dir
+        mc_dir.mkdir(parents=True, exist_ok=True)
         
         # Determine the Minecraft version from manifest
         mc_version = config.manifest.minecraft_version
@@ -100,7 +110,7 @@ class LaunchManager:
         try:
             command = mcl_command.get_minecraft_command(
                 version=version_id,
-                minecraft_directory=str(game_dir),
+                minecraft_directory=str(mc_dir),
                 options={
                     "username": config.auth_profile.username,
                     "uuid": config.auth_profile.uuid,
@@ -129,10 +139,12 @@ class LaunchManager:
     def build_offline_command(self, config: LaunchConfig) -> List[str]:
         """
         Build command for offline mode (simpler, no auth validation).
+        Uses a temporary copy so the stored profile is not mutated.
         """
         # For offline, token should be "0" or empty
-        config.auth_profile.token = "0"
-        return self.build_command(config)
+        offline_config = replace(config)
+        offline_config.auth_profile = replace(config.auth_profile, token="0")
+        return self.build_command(offline_config)
 
     def validate_launch_requirements(self, config: LaunchConfig) -> tuple[bool, str]:
         """
@@ -226,6 +238,7 @@ class GameProcessHandler:
         self._error_thread: Optional[threading.Thread] = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._running = False
+        self._user_stopped = False
         self._output_queue = Queue()
         self._error_queue = Queue()
         self._log_handle = None
@@ -267,6 +280,7 @@ class GameProcessHandler:
             
             self._pid = self._process.pid
             self._running = True
+            self._user_stopped = False
             
             self._write_log(f"Process started with PID: {self._pid}\n\n")
             
@@ -317,30 +331,36 @@ class GameProcessHandler:
         try:
             return_code = self._process.wait()
             self._running = False
-            
+
             # Wait for reader threads to finish
             self._output_thread.join(timeout=2)
             self._error_thread.join(timeout=2)
-            
+
             # Process remaining output
             self._drain_queues()
-            
+
             self._write_log(f"\n=== Process exited with code: {return_code} ===\n")
-            
-            # Determine if crash or normal exit
-            is_crash = return_code != 0
-            
+
+            # A stop requested by the launcher is always a normal exit.
+            # Closing the game window also returns 0 on most platforms.
+            user_stopped = self._user_stopped
+            is_crash = (return_code != 0) and not user_stopped
+
             if is_crash and self.on_crash:
-                # Get last few lines of error output for crash report
                 error_lines = self._get_recent_errors()
                 self.on_crash(return_code, error_lines)
             elif self.on_exit:
                 self.on_exit(return_code)
-                
+
         except Exception as e:
             self._write_log(f"Monitor error: {e}\n")
-            if self.on_crash:
-                self.on_crash(-1, f"Monitor error: {e}")
+            # Always notify the UI, otherwise the launcher keeps showing
+            # the "running" state forever.
+            try:
+                if self.on_exit:
+                    self.on_exit(self._process.poll() if self._process else -1)
+            except Exception:
+                pass
         finally:
             self._cleanup()
 
@@ -408,8 +428,9 @@ class GameProcessHandler:
         """
         if not self._process or not self._running:
             return True
-        
+
         try:
+            self._user_stopped = True
             self._write_log("\n=== Stopping process ===\n")
             
             # Try graceful termination
@@ -491,7 +512,8 @@ class LaunchController:
         on_started: Callable[[int], None],
         on_crash: Callable[[int, str], None],
         on_exit: Callable[[int], None],
-        on_log: Callable[[str], None]
+        on_log: Callable[[str], None],
+        minecraft_directory: Optional[Path] = None
     ) -> bool:
         """
         Execute full launch sequence.
@@ -525,7 +547,8 @@ class LaunchController:
                 auth_profile=auth_profile,
                 game_directory=game_directory,
                 jvm_args=jvm_args,
-                custom_args=custom_args
+                custom_args=custom_args,
+                minecraft_directory=minecraft_directory
             )
             
             # Validate
