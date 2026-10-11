@@ -24,7 +24,8 @@ from core import (
     LaunchManager, LaunchConfig, GameProcessHandler,
     parse_jvm_args, IconManager,
     get_builtin_manifest, get_builtin_profiles, is_builtin_profile,
-    get_official_releases, build_vanilla_manifest, get_required_java_version,
+    get_all_versions, get_versions_cached, get_official_releases,
+    build_vanilla_manifest, get_required_java_version,
     get_install_stats, delete_installed_version, get_installed_size,
     get_installed_packs, get_pack, is_version_installed,
     ensure_instance_dir, get_instance_dir, remove_empty_instance, instance_exists
@@ -54,6 +55,7 @@ class StatsThread(QThread):
 
     def __init__(self, version: str):
         super().__init__()
+        self.setObjectName(f"StatsThread-{version}")
         self.version = version
 
     def run(self):
@@ -86,6 +88,7 @@ class InstallThread(QThread):
 
     def __init__(self, version: str, minecraft_directory: Path):
         super().__init__()
+        self.setObjectName(f"InstallThread-{version}")
         self.version = version
         self.minecraft_directory = minecraft_directory
 
@@ -132,6 +135,7 @@ class DeleteThread(QThread):
 
     def __init__(self, version: str, minecraft_directory: Path):
         super().__init__()
+        self.setObjectName(f"DeleteThread-{version}")
         self.version = version
         self.minecraft_directory = minecraft_directory
 
@@ -164,6 +168,7 @@ class LaunchThread(QThread):
         minecraft_directory: Path = None
     ):
         super().__init__()
+        self.setObjectName(f"LaunchThread-{manifest.minecraft_version}")
         self.launch_manager = launch_manager
         self.process_handler = process_handler
         self.manifest = manifest
@@ -175,24 +180,66 @@ class LaunchThread(QThread):
         self.custom_args = custom_args
         self.on_progress = on_progress
         self.on_finished = on_finished
+        self._cancelled = False
+
+    def cancel(self):
+        """Ask the thread to stop at the next checkpoint."""
+        self._cancelled = True
+
+    def _cancelled_check(self):
+        if self._cancelled:
+            raise RuntimeError("Запуск отменён пользователем")
+
+    def _on_java_progress(self, current: int, total: int):
+        """
+        Forward the Java download progress to the GUI.
+
+        The Java step owns the 5-20 % band of the launch progress bar so the
+        window visibly reacts instead of appearing to hang.
+        """
+        if total > 0:
+            percent = int((current / total) * 100)
+            stage = 12 + percent * 8 // 100
+            self.progress_changed.emit(
+                stage,
+                f"Загрузка Java {self.java_version}: {percent}%"
+                f" ({current // (1024 * 1024)} из {total // (1024 * 1024)} МБ)",
+            )
+        else:
+            self.progress_changed.emit(
+                12, f"Загрузка Java {self.java_version}..."
+            )
 
     def run(self):
         try:
             self.progress_changed.emit(0, "Проверка требований...")
-            
+
             # 1. Ensure Java - runtimes are shared by every instance, so they
-            # live in the install root and not inside the instance folder.
-            self.progress_changed.emit(10, f"Проверка Java {self.java_version}...")
-            java_install = JavaManager(self.minecraft_directory).ensure_java(self.java_version)
+            #    live in the install root and not inside the instance folder.
+            #    ensure_java() may download ~100 MB, so its progress has to be
+            #    forwarded; otherwise the UI looks frozen for minutes.
+            self.progress_changed.emit(
+                5, f"Проверка Java {self.java_version}..."
+            )
+
+            java_install = JavaManager(
+                self.minecraft_directory
+            ).ensure_java(self.java_version, progress_callback=self._on_java_progress)
+
             if not java_install.is_valid:
-                self.finished.emit(False, f"Java {self.java_version} недоступна: {java_install.error}")
+                self.finished.emit(
+                    False,
+                    f"Java {self.java_version} недоступна: {java_install.error}"
+                )
                 return
             
             # 2. Check game files
+            self._cancelled_check()
             self.progress_changed.emit(20, "Проверка файлов игры...")
             # (File check/download handled by previous stage)
-            
+
             # 3. Build launch config
+            self._cancelled_check()
             self.progress_changed.emit(40, "Подготовка команды запуска...")
             launch_config = LaunchConfig(
                 manifest=self.manifest,
@@ -211,6 +258,7 @@ class LaunchThread(QThread):
                 return
             
             # 4. Build command
+            self._cancelled_check()
             self.progress_changed.emit(60, "Сборка команды запуска...")
             if self.auth_profile and self.auth_profile.auth_type == "offline":
                 command = self.launch_manager.build_offline_command(launch_config)
@@ -360,6 +408,15 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat("%p% - %v/%m файлов")
         content_layout.addWidget(self.progress_bar)
 
+        # Lets the user abort a launch that is stuck (e.g. downloading Java).
+        self.cancel_button = QPushButton("Отменить запуск")
+        self.cancel_button.setObjectName("dangerButton")
+        self.cancel_button.setFixedHeight(32)
+        self.cancel_button.setVisible(False)
+        self.cancel_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_button.clicked.connect(self._on_cancel_launch)
+        content_layout.addWidget(self.cancel_button, 0, Qt.AlignmentFlag.AlignRight)
+
         self.status_label = QLabel("")
         self.status_label.setObjectName("infoLabel")
         self.status_label.setVisible(False)
@@ -383,6 +440,7 @@ class MainWindow(QMainWindow):
         self.versions_page.delete_requested.connect(self._on_version_delete_requested)
         self.versions_page.launch_options_requested.connect(self._open_settings)
         self.versions_page.open_folder_requested.connect(self._open_instance_folder)
+        self.versions_page.refresh_requested.connect(self._on_refresh_versions)
         self.stack.addWidget(self.versions_page)
 
         self.stack.addWidget(PlaceholderPage("Сборки", "builds"))
@@ -473,6 +531,23 @@ class MainWindow(QMainWindow):
         if self.profile_widget is None:
             return
         self.profile_widget._on_auth_clicked()
+
+    def _on_refresh_versions(self):
+        """Refetch the version list from Mojang and rewrite the cache."""
+        button = self.versions_page.refresh_button
+        button.setEnabled(False)
+        button.setText("Обновление...")
+
+        def restore():
+            button.setEnabled(True)
+            button.setText("Обновить")
+
+        def do_refresh():
+            self._load_official_versions(True)
+            restore()
+
+        # Deferred so the button state is painted before the fetch starts.
+        QTimer.singleShot(0, do_refresh)
 
     def _open_instance_folder(self, pack_id: str):
         """Open the per-instance game folder of a pack in the file manager."""
@@ -565,16 +640,16 @@ class MainWindow(QMainWindow):
             qss = qss.replace("url(assets/", f"url({qss_path.parent.as_posix()}/")
             self.setStyleSheet(qss)
 
-    def _load_official_versions(self):
+    def _load_official_versions(self, force_refresh: bool = False):
         """
-        Fetch the official release list from Mojang.
+        Provide the official version list for the "Версии" page.
 
-        The list only feeds the "Версии" page, which is the single place where
-        official versions can be installed. The home page shows installed
-        packs instead (see _refresh_packs).
+        The list is served from the on-disk cache, so the page opens instantly.
+        Passing force_refresh (the "Обновить" button) goes back to Mojang and
+        rewrites the cache.
         """
         try:
-            versions = get_official_releases()
+            versions = get_versions_cached(self.config.install_path, force_refresh)
         except Exception as e:
             self.status_label.setText(f"Ошибка загрузки списка версий: {e}")
             self.status_label.setVisible(True)
@@ -583,6 +658,10 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "versions_page"):
             self.versions_page.set_versions(versions)
+
+        if force_refresh:
+            self.status_label.setText(f"Список версий обновлён: {len(versions)}")
+            self.status_label.setVisible(True)
 
         self._refresh_packs()
 
@@ -665,8 +744,7 @@ class MainWindow(QMainWindow):
         self.home_page.set_hero(
             title=pack.display_name,
             description=(
-                f"Готова к запуску · {pack.file_count} файлов · "
-                f"{pack.size_mb:.1f} МБ"
+                f"Готова к запуску · {pack.size_mb:.1f} МБ"
                 + (f" · {played}" if played else "")
             ),
             loader=pack.loader,
@@ -676,8 +754,7 @@ class MainWindow(QMainWindow):
         self.home_page.set_hero_tags_visible(True)
 
         self.home_page.set_summary(
-            f"Тип: {pack.loader} · Файлов: {pack.file_count} · "
-            f"Размер: {pack.size_mb:.1f} МБ"
+            f"Тип: {pack.loader} · Размер: {pack.size_mb:.1f} МБ"
         )
 
     def _update_last_launch_hero(self):
@@ -1000,10 +1077,24 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(value)
         self.status_label.setText(status)
         self.status_label.setVisible(True)
+        # The cancel button belongs to the launch flow only.
+        self.cancel_button.setVisible(self._launch_thread is not None)
 
     def _hide_progress(self):
         self.progress_bar.setVisible(False)
         self.status_label.setVisible(False)
+        self.cancel_button.setVisible(False)
+
+    def _on_cancel_launch(self):
+        """Abort a launch that is stuck (typically a silent Java download)."""
+        thread = getattr(self, "_launch_thread", None)
+        if thread is None or not thread.isRunning():
+            return
+
+        thread.cancel()
+        self.cancel_button.setEnabled(False)
+        self._append_log("[LAUNCH] Отмена запуска...")
+        self._show_progress(0, "Отмена запуска...")
 
     def _offer_offline_login(self) -> Optional[AuthProfile]:
         """
@@ -1091,6 +1182,8 @@ class MainWindow(QMainWindow):
         # Disable play button during launch
         self.play_button.setEnabled(False)
         self.play_button.setText("Запуск...")
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setVisible(True)
 
         # Create launch manager
         self._launch_manager = LaunchManager()
@@ -1117,6 +1210,11 @@ class MainWindow(QMainWindow):
             on_progress=self._on_launch_progress,
             on_finished=self._on_launch_finished
         )
+        # The thread reports through signals, not through the callbacks above,
+        # so they must be connected - otherwise the window gets no feedback at
+        # all and looks frozen while Java is downloading.
+        self._launch_thread.progress_changed.connect(self._on_launch_progress)
+        self._launch_thread.finished.connect(self._on_launch_finished)
         self._launch_thread.start()
 
     def _on_launch_progress(self, progress: int, message: str):

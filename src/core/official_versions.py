@@ -22,25 +22,58 @@ _USER_AGENT = "minecraft-launcher-lib/melon-launcher"
 
 @dataclass(frozen=True)
 class OfficialVersion:
-    """A single release version of Minecraft: Java Edition."""
+    """A single version of Minecraft: Java Edition."""
 
     id: str
     release_time: str
+    # "release", "snapshot", "old_beta" or "old_alpha" as Mojang reports it.
+    type: str = "release"
 
     @property
     def display_name(self) -> str:
         return self.id
 
+    @property
+    def is_release(self) -> bool:
+        return self.type == "release"
+
+    @property
+    def is_snapshot(self) -> bool:
+        return self.type == "snapshot"
+
+    @property
+    def is_beta(self) -> bool:
+        return self.type == "old_beta"
+
+    @property
+    def is_alpha(self) -> bool:
+        return self.type == "old_alpha"
+
+    @property
+    def category(self) -> str:
+        """Filter category used by the toolbar chips."""
+        return {
+            "release": "Release",
+            "snapshot": "Snapshot",
+            "old_beta": "Beta",
+            "old_alpha": "Alpha",
+        }.get(self.type, "Release")
+
+    @property
+    def category_key(self) -> str:
+        """Lowercase key used by the filter comparisons."""
+        return self.category.lower()
+
 
 _versions_cache: Optional[List[OfficialVersion]] = None
 
 
-def get_official_releases(force_refresh: bool = False) -> List[OfficialVersion]:
+def get_all_versions(force_refresh: bool = False) -> List[OfficialVersion]:
     """
-    Return all official release versions, newest first.
+    Return every official version Mojang publishes, newest first.
 
-    Snapshots, alpha and beta versions are filtered out.
-    Results are cached in-process because the manifest changes rarely.
+    Includes releases as well as snapshots, beta and alpha builds. Results are
+    cached in-process because the manifest changes rarely.
     """
     global _versions_cache
 
@@ -49,17 +82,64 @@ def get_official_releases(force_refresh: bool = False) -> List[OfficialVersion]:
 
     versions: List[OfficialVersion] = []
     for entry in mcl_utils.get_version_list():
-        if entry.get("type") != "release":
+        entry_type = str(entry.get("type") or "release")
+        if entry_type not in ("release", "snapshot", "old_beta", "old_alpha"):
             continue
         versions.append(
             OfficialVersion(
                 id=str(entry["id"]),
                 release_time=str(entry.get("releaseTime") or ""),
+                type=entry_type,
             )
         )
 
     _versions_cache = versions
     return versions
+
+
+def get_official_releases(force_refresh: bool = False) -> List[OfficialVersion]:
+    """
+    Return official release versions only, newest first.
+
+    Snapshots, beta and alpha builds are filtered out. Results are cached
+    in-process because the manifest changes rarely.
+    """
+    return [v for v in get_all_versions(force_refresh) if v.is_release]
+
+
+def _parse_version_numbers(minecraft_version: str) -> tuple[int, int, int]:
+    """
+    Extract the leading numeric triple from a Minecraft version id.
+
+    Handles ids that carry a non-numeric part: snapshots
+    (``26.4-snapshot-3``), betas (``b1.8.1``) and alphas (``a1.2.6``). The
+    leading letters of beta/alpha ids are dropped so their numbers are read
+    like a classic ``1.8.1`` version.
+    """
+    text = str(minecraft_version).strip().lower()
+
+    # Strip the leading letters used by beta/alpha builds (b1.8.1, a1.2.6).
+    while text and not text[0].isdigit():
+        text = text[1:]
+
+    # Keep only the numeric segments of the first components; suffixes such as
+    # "-snapshot-3", "-rc-1" or "_04" are not version numbers.
+    segments = []
+    for chunk in text.replace("_", ".").split("."):
+        digits = ""
+        for char in chunk:
+            if char.isdigit():
+                digits += char
+            else:
+                break
+        if digits == "":
+            break
+        segments.append(int(digits))
+
+    major = segments[0] if len(segments) > 0 else 0
+    minor = segments[1] if len(segments) > 1 else 0
+    patch = segments[2] if len(segments) > 2 else 0
+    return major, minor, patch
 
 
 def get_required_java_version(minecraft_version: str) -> int:
@@ -72,15 +152,9 @@ def get_required_java_version(minecraft_version: str) -> int:
     * anything older  -> Java 8
     * new major scheme (e.g. 26.1) -> Java 21
     """
-    parts = str(minecraft_version).split(".")
-    try:
-        major = int(parts[0])
-        minor = int(parts[1]) if len(parts) > 1 else 0
-        patch = int(parts[2]) if len(parts) > 2 else 0
-    except (ValueError, IndexError):
-        return 17
+    major, minor, patch = _parse_version_numbers(minecraft_version)
 
-    # New versioning scheme (26.x and above)
+    # New versioning scheme (26.x and above). Includes snapshots of it.
     if major > 1:
         return 21
 
@@ -296,3 +370,84 @@ def delete_installed_version(minecraft_directory: Path, version_id: str) -> int:
     freed = get_installed_size(minecraft_directory, version_id)
     shutil.rmtree(directory)
     return freed
+
+
+# ==================== ON-DISK VERSION CACHE ====================
+# The manifest holds ~900 entries; fetching and parsing it on every start is
+# slow, and it changes rarely. The list is therefore stored next to the other
+# launcher data and only refetched when the user asks for it.
+
+_VERSION_CACHE_FILE = "versions_cache.json"
+
+
+def _cache_path(install_path) -> Path:
+    return Path(install_path) / _VERSION_CACHE_FILE
+
+
+def load_cached_versions(install_path) -> List[OfficialVersion]:
+    """Read the version list from disk. Returns an empty list when absent."""
+    import json
+
+    path = _cache_path(install_path)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    versions = []
+    for entry in data:
+        try:
+            versions.append(
+                OfficialVersion(
+                    id=str(entry["id"]),
+                    release_time=str(entry.get("release_time") or ""),
+                    type=str(entry.get("type") or "release"),
+                )
+            )
+        except (KeyError, TypeError):
+            continue
+    return versions
+
+
+def save_cached_versions(install_path, versions: List[OfficialVersion]) -> bool:
+    """Write the version list to disk. Returns True on success."""
+    import json
+
+    path = _cache_path(install_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = [
+            {"id": v.id, "release_time": v.release_time, "type": v.type}
+            for v in versions
+        ]
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        return True
+    except OSError:
+        return False
+
+
+def get_versions_cached(install_path, force_refresh: bool = False) -> List[OfficialVersion]:
+    """
+    Version list for the UI: cache first, network only when asked.
+
+    On a normal start the list comes straight from disk, so the "Версии" page
+    opens instantly. ``force_refresh`` goes back to Mojang and rewrites the
+    cache.
+    """
+    global _versions_cache
+
+    if not force_refresh:
+        cached = load_cached_versions(install_path)
+        if cached:
+            _versions_cache = cached
+            return cached
+
+    versions = get_all_versions(force_refresh=True)
+    if versions:
+        save_cached_versions(install_path, versions)
+    return versions

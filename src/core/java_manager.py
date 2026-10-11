@@ -19,6 +19,37 @@ class JavaInstallation:
     error: str = ""
 
 
+def parse_java_version(output: str) -> Optional[int]:
+    """
+    Extract the Java major version from `java -version` output.
+
+    Java 8 and older report themselves with a legacy ``1.x`` scheme::
+
+        openjdk version "1.8.0_402" 2022-01-18   ->  8
+        openjdk version "17.0.8" 2023-07-18      -> 17
+        openjdk version "21" 2023-09-19          -> 21
+
+    Reading only the first number would report 1 for every Java 8 build and
+    make a correctly installed runtime look like a version mismatch.
+    """
+    import re
+
+    match = re.search(r'version\s+"([^"]+)"', output)
+    if not match:
+        return None
+
+    raw = match.group(1).strip()
+
+    # Legacy scheme: 1.8.0_402 / 1.7.0 / 1.6.0_45
+    if raw.startswith("1."):
+        legacy = re.match(r"1\.(\d+)", raw)
+        return int(legacy.group(1)) if legacy else None
+
+    # Modern scheme: 17.0.8 / 21 / 11.0.2
+    modern = re.match(r"(\d+)", raw)
+    return int(modern.group(1)) if modern else None
+
+
 class JavaManager:
     """
     Manages Java Runtime: detection, validation, and downloading from Adoptium Temurin.
@@ -72,20 +103,16 @@ class JavaManager:
             
             # java -version outputs to stderr
             version_output = result.stderr + result.stdout
-            
-            # Parse version from output (e.g., "openjdk version "17.0.8" 2023-07-18")
-            import re
-            version_match = re.search(r'version\s+"(\d+)', version_output)
-            if version_match:
-                detected_version = int(version_match.group(1))
-                if detected_version != required_version:
-                    return JavaInstallation(
-                        path=java_exe,
-                        version=required_version,
-                        vendor="unknown",
-                        is_valid=False,
-                        error=f"Version mismatch: expected {required_version}, found {detected_version}"
-                    )
+
+            detected_version = parse_java_version(version_output)
+            if detected_version is not None and detected_version != required_version:
+                return JavaInstallation(
+                    path=java_exe,
+                    version=required_version,
+                    vendor="unknown",
+                    is_valid=False,
+                    error=f"Version mismatch: expected {required_version}, found {detected_version}"
+                )
             
             # Detect vendor
             vendor = "unknown"
@@ -131,27 +158,24 @@ class JavaManager:
                 timeout=10
             )
             version_output = result.stderr + result.stdout
-            
-            import re
-            version_match = re.search(r'version\s+"(\d+)', version_output)
-            if version_match:
-                detected_version = int(version_match.group(1))
-                if detected_version == required_version:
-                    java_path = Path(shutil.which("java")).resolve()
-                    vendor = "unknown"
-                    if "temurin" in version_output.lower():
-                        vendor = "Temurin"
-                    elif "oracle" in version_output.lower():
-                        vendor = "Oracle"
-                    elif "openjdk" in version_output.lower():
-                        vendor = "OpenJDK"
-                    
-                    return JavaInstallation(
-                        path=java_path,
-                        version=required_version,
-                        vendor=vendor,
-                        is_valid=True
-                    )
+
+            detected_version = parse_java_version(version_output)
+            if detected_version == required_version:
+                java_path = Path(shutil.which("java")).resolve()
+                vendor = "unknown"
+                if "temurin" in version_output.lower():
+                    vendor = "Temurin"
+                elif "oracle" in version_output.lower():
+                    vendor = "Oracle"
+                elif "openjdk" in version_output.lower():
+                    vendor = "OpenJDK"
+
+                return JavaInstallation(
+                    path=java_path,
+                    version=required_version,
+                    vendor=vendor,
+                    is_valid=True
+                )
         except Exception:
             pass
         return None
@@ -241,13 +265,16 @@ class JavaManager:
             tmp_path = Path(tmp_file.name)
         
         try:
-            # Download with progress
-            response = requests.get(download_url, stream=True, timeout=60)
+            # Download with progress. The timeouts matter: (connect, read) fail
+            # fast on an unreachable host instead of hanging the launcher.
+            response = requests.get(
+                download_url, stream=True, timeout=(15, 60)
+            )
             response.raise_for_status()
-            
+
             total_size = int(response.headers.get("content-length", 0))
             downloaded = 0
-            
+
             with open(tmp_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:

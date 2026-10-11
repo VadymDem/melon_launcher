@@ -170,6 +170,7 @@ class BuildInfoWidget(QWidget):
         class DownloadThread(QThread):
             def __init__(self, manager, url, callback):
                 super().__init__()
+                self.setObjectName(f"BuildInfoDownloadThread-{url}")
                 self.manager = manager
                 self.url = url
                 self.callback = callback

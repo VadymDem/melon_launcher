@@ -4,7 +4,8 @@
 Layout: a filter/search toolbar, a scrollable list of releases on the left and
 a detail card for the currently selected version on the right.
 """
-from typing import Optional
+from typing import List, Optional
+from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtWidgets import (
@@ -31,6 +32,17 @@ FILTERS = ["Все", "Release", "Snapshot", "Beta", "Alpha"]
 # Width of the detail column on the right.
 DETAIL_WIDTH = 320
 
+# Cards have a 1 px border; the content is inset by that much so it cannot
+# paint over the rounded corners.
+CARD_INSET = 1
+CARD_RADIUS = 16
+
+# Version list geometry: the list is virtualised, so the row height decides how
+# many rows exist as widgets at any moment.
+ROW_HEIGHT = 56
+# Extra rows kept above and below the viewport so fast scrolling stays smooth.
+ROW_BUFFER = 6
+
 
 class StatsThread(QThread):
     """Computes the install stats (file count / size) of a single version."""
@@ -39,6 +51,7 @@ class StatsThread(QThread):
 
     def __init__(self, version: str, parent=None):
         super().__init__(parent)
+        self.setObjectName(f"StatsThread-{version}")
         self.version = version
 
     def run(self):
@@ -61,21 +74,27 @@ class FilterChip(QPushButton):
         self.setObjectName("filterChip")
         self.setCheckable(True)
         self.setFixedHeight(34)
-        self.setMinimumWidth(54)
+        self.setMinimumWidth(48)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
 
 class VersionRow(QFrame):
-    """One line of the version list."""
+    """
+    One line of the version list.
+
+    Rows are pooled and reused: switching category chips must not create or
+    destroy hundreds of widgets, which caused visible glitches.
+    """
 
     clicked = pyqtSignal(str)
     delete_requested = pyqtSignal(str)
 
-    def __init__(self, version: str, mc_version: str, java: int,
-                 installed: bool, parent=None):
+    def __init__(self, version: str = "", mc_version: str = "", java: int = 21,
+                 installed: bool = False, category: str = "Release", parent=None):
         super().__init__(parent)
         self.version = version
         self.installed = installed
+        self._selected = False
         self.setObjectName("versionRow")
         self.setFixedHeight(56)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -91,8 +110,8 @@ class VersionRow(QFrame):
         self.name_label.setMinimumWidth(96)
         layout.addWidget(self.name_label)
 
-        self.type_label = QLabel("Release")
-        self.type_label.setObjectName("versionRowType")
+        # Snapshots / beta / alpha get their own muted colour.
+        self.type_label = QLabel(category)
         self.type_label.setMinimumWidth(88)
         layout.addWidget(self.type_label)
 
@@ -101,10 +120,53 @@ class VersionRow(QFrame):
         self.java_label.setMinimumWidth(88)
         layout.addWidget(self.java_label)
 
-        self.status_label = QLabel("Установлена" if installed else "Не скачана")
-        self.status_label.setObjectName("versionRowInstalled" if installed
-                                        else "versionRowMissing")
+        self.status_label = QLabel("Не скачана")
         layout.addWidget(self.status_label, 1)
+
+        self.setVersion(version, java, installed, category)
+
+    def setVersion(self, version: str, java: int, installed: bool,
+                   category: str):
+        """Rebind this row to another version without recreating widgets."""
+        self.version = version
+        self.installed = installed
+
+        self.name_label.setText(version)
+        self.type_label.setText(category)
+        self.java_label.setText(f"Java {java}")
+
+        type_object = (
+            "versionRowType" if category == "Release" else "versionRowTypeAlt"
+        )
+        if self.type_label.objectName() != type_object:
+            self.type_label.setObjectName(type_object)
+            self._repolish(self.type_label)
+
+        status_text = "Установлена" if installed else "Не скачана"
+        status_object = (
+            "versionRowInstalled" if installed else "versionRowMissing"
+        )
+        if self.status_label.objectName() != status_object:
+            self.status_label.setObjectName(status_object)
+            self._repolish(self.status_label)
+        if self.status_label.text() != status_text:
+            self.status_label.setText(status_text)
+
+        self.set_selected(self._selected)
+
+    @staticmethod
+    def _repolish(widget):
+        """Re-evaluate the stylesheet after an object name change."""
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def set_selected(self, selected: bool):
+        """Highlight or un-highlight the row."""
+        if selected == self._selected and self.objectName() != "":
+            return
+        self._selected = selected
+        self.setObjectName("versionRowSelected" if selected else "versionRow")
+        self._repolish(self)
 
     def mousePressEvent(self, event):
         self.clicked.emit(self.version)
@@ -166,6 +228,11 @@ class VersionsPage(QWidget):
         self.setObjectName("versionsPage")
 
         self._versions = []
+        self._by_id = {}
+        self._pool: List[VersionRow] = []
+        self._visible = []
+        self._installed: set[str] = set()
+        self._syncing = False
         self._filter = "Release"
         self._search = ""
         self._selected: Optional[str] = None
@@ -204,8 +271,9 @@ class VersionsPage(QWidget):
         self.search_input.setObjectName("versionsSearch")
         self.search_input.setPlaceholderText("Поиск версии")
         self.search_input.setFixedHeight(34)
-        # Shrinkable so the toolbar never pushes the buttons off-screen.
-        self.search_input.setMinimumWidth(110)
+        # Shrinks hard so the toolbar keeps every button on screen even on
+        # high-DPI setups where the window has few logical pixels.
+        self.search_input.setMinimumWidth(70)
         self.search_input.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
@@ -213,7 +281,8 @@ class VersionsPage(QWidget):
         row.addWidget(self.search_input, 1)
 
         self.refresh_button = QPushButton("Обновить")
-        self.refresh_button.setObjectName("secondaryButton")
+        self.refresh_button.setObjectName("compactButton")
+        self.refresh_button.setToolTip("Обновить список версий")
         self.refresh_button.setFixedHeight(34)
         # Never squeezed: the label must stay readable, so the search field
         # gives up space first.
@@ -223,6 +292,7 @@ class VersionsPage(QWidget):
         self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         row.addWidget(self.refresh_button, 0)
+        row.addSpacing(2)
 
         return row
 
@@ -232,11 +302,15 @@ class VersionsPage(QWidget):
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(0, 0, 0, 0)
+        # Inset by the border width so rows never overlap the rounded frame.
+        layout.setContentsMargins(CARD_INSET, CARD_INSET, CARD_INSET, CARD_INSET)
         layout.setSpacing(0)
 
         header = QWidget()
         header.setObjectName("versionHeaderRow")
+        # A plain QWidget ignores stylesheet backgrounds (including radius)
+        # unless this attribute is set.
+        header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(18, 0, 18, 0)
         header_layout.setSpacing(16)
@@ -252,18 +326,35 @@ class VersionsPage(QWidget):
 
         self.scroll = QScrollArea()
         self.scroll.setObjectName("versionsScroll")
-        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidgetResizable(False)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        # Rebinding rows while scrolling must not wait for a repaint.
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scrolled)
 
+        # Virtualised list: only the rows inside the viewport exist as widgets.
+        # The two spacers provide the scrollable height, so switching category
+        # only has to fill the visible slice instead of all ~900 entries.
         self.list_content = QWidget()
         self.list_content.setObjectName("versionsListContent")
+        self.list_content.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.list_layout = QVBoxLayout(self.list_content)
         self.list_layout.setContentsMargins(0, 0, 0, 0)
         self.list_layout.setSpacing(0)
-        self.list_layout.addStretch()
+
+        self.top_spacer = QWidget()
+        self.top_spacer.setFixedHeight(0)
+        self.list_layout.addWidget(self.top_spacer)
+
+        self.rows_host = QWidget()
+        self.rows_host.setObjectName("versionsListContent")
+        self.list_layout.addWidget(self.rows_host)
+
+        self.bottom_spacer = QWidget()
+        self.bottom_spacer.setFixedHeight(0)
+        self.list_layout.addWidget(self.bottom_spacer)
 
         self.scroll.setWidget(self.list_content)
         layout.addWidget(self.scroll, 1)
@@ -402,24 +493,26 @@ class VersionsPage(QWidget):
     # ---------- data ----------
 
     def set_versions(self, versions):
-        """Fill the page with the official release list."""
+        """Fill the page with the official version list (all categories)."""
         self._versions = list(versions)
+        self._by_id = {v.id: v for v in self._versions}
+        self._refresh_installed()
 
-        if self._selected and self._selected not in {v.id for v in self._versions}:
-            self._selected = None
-
-        if not self._selected and self._versions:
-            self._selected = self._versions[0].id
+        # The default selection has to match the active filter, otherwise the
+        # detail card describes a version that is not in the visible list.
+        matching = self._visible_versions()
+        if self._selected not in {v.id for v in matching}:
+            self._selected = matching[0].id if matching else ""
 
         self._render_rows()
         if self._selected:
             self._select(self._selected)
 
     def _visible_versions(self):
+        """Apply the category chip and the search box to the full list."""
         result = []
         for version in self._versions:
-            if self._filter not in ("Все", "Release"):
-                # Snapshots / beta / alpha are not published by the loader yet.
+            if self._filter != "Все" and version.category != self._filter:
                 continue
             if self._search and self._search.lower() not in version.id.lower():
                 continue
@@ -427,66 +520,179 @@ class VersionsPage(QWidget):
         return result
 
     def _render_rows(self):
-        while self.list_layout.count() > 1:  # keep the trailing stretch
-            item = self.list_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
+        """
+        Rebuild the visible slice of the list.
 
-        self._rows = {}
+        Only rows near the viewport exist as widgets; the spacers above and
+        below provide the full scroll height. This keeps switching categories
+        instant even though the list holds ~900 versions.
+        """
         visible = self._visible_versions()
-
-        for version in visible:
-            row = VersionRow(
-                version=version.id,
-                mc_version=version.id,
-                java=get_required_java_version(version.id),
-                installed=self._is_installed(version.id),
-            )
-            row.clicked.connect(self._select)
-            row.delete_requested.connect(self.delete_requested.emit)
-            self.list_layout.insertWidget(self.list_layout.count() - 1, row)
-            self._rows[version.id] = row
+        self._visible = visible
 
         has_rows = bool(visible)
         self.scroll.setVisible(has_rows)
         self.list_empty.setVisible(not has_rows)
         if not has_rows:
-            self.list_empty.setText(
-                "Поддерживаются только релизные версии"
-                if self._filter not in ("Все", "Release")
-                else "Ничего не найдено"
+            self.list_empty.setText("Ничего не найдено")
+
+        total_height = len(visible) * ROW_HEIGHT
+        self.list_content.setFixedHeight(max(total_height, 1))
+        self.list_content.setMinimumWidth(self.scroll.viewport().width())
+
+        self._sync_rows()
+
+    def _visible_range(self):
+        """Index range of rows that must exist as widgets right now."""
+        total = len(self._visible)
+        if not total:
+            return 0, 0
+
+        viewport_h = max(self.scroll.viewport().height(), ROW_HEIGHT)
+        offset = self.scroll.verticalScrollBar().value()
+
+        first = max(0, offset // ROW_HEIGHT - ROW_BUFFER)
+        visible_count = viewport_h // ROW_HEIGHT + 1
+        last = min(total, first + visible_count + ROW_BUFFER * 2)
+        return first, last
+
+    def _on_scrolled(self, _value):
+        """Rebind rows after the scroll position changed."""
+        self._sync_rows()
+
+    def _sync_rows(self):
+        """Fill the pooled rows with whatever belongs in the viewport."""
+        # Resizing the spacers moves the scrollbar, which fires valueChanged
+        # and would re-enter this method; the guard stops that recursion.
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self._sync_rows_inner()
+        finally:
+            self._syncing = False
+
+    def _sync_rows_inner(self):
+        visible = self._visible
+        first, last = self._visible_range()
+        needed = last - first
+
+        pool = self._pool
+        while len(pool) < needed:
+            row = VersionRow()
+            row.clicked.connect(self._select)
+            row.delete_requested.connect(self.delete_requested.emit)
+            self.list_layout.insertWidget(
+                self.list_layout.indexOf(self.bottom_spacer), row
             )
+            pool.append(row)
+        for row in pool[needed:]:
+            row.hide()
+
+        # Spacers frame the visible block and create the scrollable height.
+        top_height = first * ROW_HEIGHT
+        bottom_height = max(0, (len(visible) - last) * ROW_HEIGHT)
+        if self.top_spacer.height() != top_height:
+            self.top_spacer.setFixedHeight(top_height)
+        if self.bottom_spacer.height() != bottom_height:
+            self.bottom_spacer.setFixedHeight(bottom_height)
+
+        self._rows = {}
+        # Only the slice that fits the viewport gets real data; the rest of the
+        # pool stays hidden until it scrolls into view.
+        for offset, row in enumerate(pool[:needed]):
+            version = visible[first + offset]
+            row.setVersion(
+                version.id,
+                get_required_java_version(version.id),
+                self._is_installed(version.id),
+                version.category,
+            )
+            row.set_selected(version.id == self._selected)
+            row.show()
+            self._rows[version.id] = row
 
     def _is_installed(self, version_id: str) -> bool:
-        return is_version_installed(self.config.install_path, version_id)
+        return version_id in self._installed
+
+    def _refresh_installed(self):
+        """
+        Snapshot which versions are on disk.
+
+        Checking the filesystem once per render made every chip switch walk
+        hundreds of paths; the result is cached until it is invalidated.
+        """
+        versions_dir = Path(self.config.install_path) / "versions"
+        installed = set()
+        if versions_dir.is_dir():
+            try:
+                for folder in versions_dir.iterdir():
+                    if folder.is_dir() and is_version_installed(
+                        self.config.install_path, folder.name
+                    ):
+                        installed.add(folder.name)
+            except OSError:
+                pass
+        self._installed = installed
+        return installed
 
     # ---------- selection ----------
 
     def _set_filter(self, name: str):
+        """Switch the category chip. Selection follows when it stays valid."""
+        if name == self._filter:
+            return
+
         self._filter = name
         for chip in self.chips:
             chip.setChecked(chip.text() == name)
+
         self._render_rows()
+
+        # A version from another category is no longer in the list, so pick the
+        # first one instead of leaving the detail card on a hidden entry.
+        if self._selected not in self._rows:
+            self._select(self._visible[0].id if self._visible else "")
+        else:
+            self._highlight_rows()
 
     def _set_search(self, text: str):
         self._search = text.strip()
         self._render_rows()
 
+        if self._selected not in self._rows:
+            self._select(self._visible[0].id if self._visible else "")
+
     def _select(self, version: str, fetch_stats: bool = True):
+        if not version:
+            self._selected = None
+            self._highlight_rows()
+            return
+
         self._selected = version
         self._highlight_rows()
 
+        info = self._by_id.get(version)
         java = get_required_java_version(version)
         installed = self._is_installed(version)
 
+        category = info.category if info else "Release"
+        is_stable = category == "Release"
+
         self.detail_title.setText(f"Minecraft {version}")
-        self.detail_subtitle.setText("Release · Vanilla")
-        self.detail_description.setText(
-            f"Официальная версия Minecraft {version} без модификаций. "
-            f"Требуется Java {java}."
+        self.detail_subtitle.setText(
+            "Установлена" if installed else f"{category} · Vanilla"
         )
+        if is_stable:
+            self.detail_description.setText(
+                f"Официальная версия Minecraft {version} без модификаций. "
+                f"Требуется Java {java}."
+            )
+        else:
+            self.detail_description.setText(
+                f"Сборка {category} Minecraft {version}. Могут быть "
+                f"нестабильности и изменения. Требуется Java {java}."
+            )
 
         self.row_java.set_value(f"{java} найдена")
         self.row_files.set_value("…")
@@ -505,20 +711,14 @@ class VersionsPage(QWidget):
             disk = get_installed_stats(self.config.install_path, version)
             self.row_files.set_value(f"{disk['files']:,}".replace(",", " "))
             self.row_size.set_value(f"{disk['size'] / (1024 * 1024):.1f} МБ")
-            self.detail_subtitle.setText("Release · Vanilla · Установлена")
-        else:
-            self.detail_subtitle.setText("Release · Vanilla")
+            self.detail_subtitle.setText(f"{category} · Vanilla · Установлена")
 
         if fetch_stats and not installed:
             self._request_stats(version)
 
     def _highlight_rows(self):
         for version, row in self._rows.items():
-            selected = version == self._selected
-            row.setObjectName("versionRowSelected" if selected else "versionRow")
-            # Re-apply the stylesheet so the new object name takes effect.
-            row.style().unpolish(row)
-            row.style().polish(row)
+            row.set_selected(version == self._selected)
 
     def _set_detail_enabled(self, enabled: bool):
         self.play_button.setEnabled(enabled)
@@ -571,6 +771,7 @@ class VersionsPage(QWidget):
 
     def refresh_installed_states(self):
         """Called after an install/delete finished so states stay correct."""
+        self._refresh_installed()
         self._render_rows()
         if self._selected:
             self._select(self._selected, fetch_stats=False)

@@ -20,6 +20,7 @@ from core.builtin_manifests import (
 )
 from core.official_versions import (
     OfficialVersion,
+    get_all_versions,
     get_official_releases,
     get_required_java_version,
     build_vanilla_manifest,
@@ -28,7 +29,10 @@ from core.official_versions import (
     is_version_installed,
     get_installed_stats,
     get_installed_size,
-    delete_installed_version
+    delete_installed_version,
+    load_cached_versions,
+    save_cached_versions,
+    get_versions_cached
 )
 from core.packs import (
     InstalledPack,
@@ -90,6 +94,7 @@ __all__ = [
     "FABRIC_1_20_4_MANIFEST",
     "FORGE_1_20_4_MANIFEST",
     "OfficialVersion",
+    "get_all_versions",
     "get_official_releases",
     "get_required_java_version",
     "build_vanilla_manifest",
@@ -99,6 +104,9 @@ __all__ = [
     "get_installed_stats",
     "get_installed_size",
     "delete_installed_version",
+    "load_cached_versions",
+    "save_cached_versions",
+    "get_versions_cached",
     "InstalledPack",
     "get_installed_packs",
     "get_pack",

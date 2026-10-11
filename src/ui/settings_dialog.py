@@ -2,41 +2,15 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
     QLabel, QLineEdit, QPushButton, QSlider, QGroupBox,
     QFileDialog, QMessageBox, QRadioButton, QButtonGroup,
-    QFormLayout, QSpinBox, QProgressBar, QComboBox, QListWidget,
-    QListWidgetItem, QTextEdit, QCheckBox, QScrollArea
+    QFormLayout, QSpinBox, QProgressBar, QComboBox,
+    QTextEdit, QCheckBox, QScrollArea
 )
 from PyQt6.QtCore import Qt, QStandardPaths, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from utils.config import Config
-from core import AuthManager, JavaManager, JavaInstallation, ModrinthAPI, ModrinthProject
+from core import AuthManager, JavaManager, JavaInstallation
 import psutil
-
-
-class ModrinthSearchWorker(QThread):
-    """Worker thread for searching Modrinth modpacks."""
-    
-    search_finished = pyqtSignal(list)
-    search_error = pyqtSignal(str)
-    
-    def __init__(self, query: str, game_version: str = None, loader: str = None):
-        super().__init__()
-        self.query = query
-        self.game_version = game_version
-        self.loader = loader
-    
-    def run(self):
-        try:
-            api = ModrinthAPI()
-            results = api.search_modpacks(
-                query=self.query,
-                game_version=self.game_version,
-                loader=self.loader,
-                limit=20
-            )
-            self.search_finished.emit(results)
-        except Exception as e:
-            self.search_error.emit(str(e))
 
 
 class JavaDownloadWorker(QThread):
@@ -48,6 +22,7 @@ class JavaDownloadWorker(QThread):
     
     def __init__(self, java_manager: JavaManager, version: int):
         super().__init__()
+        self.setObjectName(f"JavaDownloadWorker-{version}")
         self.java_manager = java_manager
         self.version = version
     
@@ -83,7 +58,6 @@ class SettingsDialog(QDialog):
         self.resize(700, 580)
         self.setModal(True)
 
-        self._search_worker: ModrinthSearchWorker | None = None
         self._java_download_worker: JavaDownloadWorker | None = None
 
         self._setup_ui()
@@ -103,9 +77,6 @@ class SettingsDialog(QDialog):
 
         # Java & RAM tab
         self.tabs.addTab(self._create_java_tab(), "Java и память")
-
-        # Modrinth tab
-        self.tabs.addTab(self._create_modrinth_tab(), "Modrinth")
 
         # Auth tab
         self.tabs.addTab(self._create_auth_tab(), "Авторизация")
@@ -285,72 +256,6 @@ class SettingsDialog(QDialog):
         layout.addStretch()
         return widget
 
-    def _create_modrinth_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(16)
-
-        # Search
-        search_group = QGroupBox("Поиск модпаков на Modrinth")
-        search_layout = QVBoxLayout(search_group)
-        search_layout.setSpacing(10)
-
-        search_row = QHBoxLayout()
-        self.modrinth_search = QLineEdit()
-        self.modrinth_search.setPlaceholderText("Название модпака...")
-        self.modrinth_search.returnPressed.connect(self._search_modrinth)
-        search_row.addWidget(self.modrinth_search, 1)
-
-        self.modrinth_game_version = QComboBox()
-        self.modrinth_game_version.addItems(["1.20.4", "1.20.1", "1.19.4", "1.19.2", "1.18.2", "1.16.5"])
-        self.modrinth_game_version.setCurrentText("1.20.4")
-        self.modrinth_game_version.setFixedWidth(120)
-        search_row.addWidget(self.modrinth_game_version)
-
-        self.modrinth_loader = QComboBox()
-        self.modrinth_loader.addItems(["Все", "fabric", "forge", "quilt", "neoforge"])
-        self.modrinth_loader.setFixedWidth(120)
-        search_row.addWidget(self.modrinth_loader)
-
-        search_btn = QPushButton("Поиск")
-        search_btn.clicked.connect(self._search_modrinth)
-        search_row.addWidget(search_btn)
-
-        search_layout.addLayout(search_row)
-
-        # Results list
-        self.modrinth_results = QListWidget()
-        self.modrinth_results.setAlternatingRowColors(True)
-        self.modrinth_results.itemDoubleClicked.connect(self._on_modrinth_selected)
-        search_layout.addWidget(self.modrinth_results)
-
-        # Progress
-        self.modrinth_progress = QProgressBar()
-        self.modrinth_progress.setVisible(False)
-        search_layout.addWidget(self.modrinth_progress)
-
-        layout.addWidget(search_group)
-
-        # Selected modpack info
-        info_group = QGroupBox("Выбранный модпак")
-        info_layout = QVBoxLayout(info_group)
-        
-        self.modrinth_info = QLabel("Модпак не выбран")
-        self.modrinth_info.setObjectName("infoLabel")
-        self.modrinth_info.setWordWrap(True)
-        info_layout.addWidget(self.modrinth_info)
-
-        self.modrinth_use_btn = QPushButton("Использовать этот модпак")
-        self.modrinth_use_btn.setEnabled(False)
-        self.modrinth_use_btn.clicked.connect(self._use_modrinth_modpack)
-        info_layout.addWidget(self.modrinth_use_btn)
-
-        layout.addWidget(info_group)
-
-        layout.addStretch()
-        return widget
-
     def _create_auth_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -496,66 +401,6 @@ class SettingsDialog(QDialog):
         
         self._java_download_worker = None
 
-    def _search_modrinth(self):
-        query = self.modrinth_search.text().strip()
-        game_version = self.modrinth_game_version.currentText() if self.modrinth_game_version.currentText() != "Все" else None
-        loader = self.modrinth_loader.currentText() if self.modrinth_loader.currentText() != "Все" else None
-        
-        self.modrinth_results.clear()
-        self.modrinth_progress.setVisible(True)
-        self.modrinth_progress.setRange(0, 0)  # Indeterminate
-        
-        self._search_worker = ModrinthSearchWorker(query, game_version, loader)
-        self._search_worker.search_finished.connect(self._on_modrinth_results)
-        self._search_worker.search_error.connect(self._on_modrinth_error)
-        self._search_worker.start()
-
-    def _on_modrinth_results(self, projects: list[ModrinthProject]):
-        self.modrinth_progress.setVisible(False)
-        
-        for project in projects:
-            item = QListWidgetItem(f"{project.title} ({project.slug})")
-            item.setData(Qt.ItemDataRole.UserRole, project)
-            item.setToolTip(f"{project.description[:200]}...\nКатегории: {', '.join(project.categories)}\nЗагрузки: {project.downloads:,}")
-            self.modrinth_results.addItem(item)
-        
-        if not projects:
-            item = QListWidgetItem("Ничего не найдено")
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-            self.modrinth_results.addItem(item)
-
-    def _on_modrinth_error(self, error: str):
-        self.modrinth_progress.setVisible(False)
-        QMessageBox.critical(self, "Ошибка поиска", f"Не удалось выполнить поиск: {error}")
-
-    def _on_modrinth_selected(self, item: QListWidgetItem):
-        project: ModrinthProject = item.data(Qt.ItemDataRole.UserRole)
-        if project:
-            self._selected_modrinth_project = project
-            self.modrinth_info.setText(
-                f"<b>{project.title}</b> ({project.slug})<br>"
-                f"{project.description[:300]}...<br>"
-                f"Категории: {', '.join(project.categories)}<br>"
-                f"Загрузки: {project.downloads:,} | Подписчики: {project.follows:,}"
-            )
-            self.modrinth_use_btn.setEnabled(True)
-        else:
-            self.modrinth_use_btn.setEnabled(False)
-
-    def _use_modrinth_modpack(self):
-        """Set the selected Modrinth modpack as the manifest URL."""
-        if hasattr(self, '_selected_modrinth_project'):
-            project = self._selected_modrinth_project
-            # We'll need to fetch versions and let user pick one
-            # For now, just show a message
-            QMessageBox.information(
-                self, "Модпак выбран",
-                f"Выбран: {project.title}\n\n"
-                f"Для полной интеграции нужно выбрать версию модпака.\n"
-                f"Это будет реализовано в следующем обновлении."
-            )
-            # TODO: Fetch versions, let user pick, build manifest URL
-
     def _browse_install_path(self):
         path = QFileDialog.getExistingDirectory(
             self, "Выберите папку установки", self.install_path.text()
@@ -642,9 +487,6 @@ class SettingsDialog(QDialog):
         self.accept()
 
     def closeEvent(self, event):
-        if self._search_worker and self._search_worker.isRunning():
-            self._search_worker.terminate()
-            self._search_worker.wait(1000)
         if self._java_download_worker and self._java_download_worker.isRunning():
             self._java_download_worker.terminate()
             self._java_download_worker.wait(1000)

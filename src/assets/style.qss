@@ -523,6 +523,27 @@ QLineEdit#versionsSearch {
 }
 
 QLineEdit#versionsSearch:focus { border-color: #89b4fa; }
+
+/* Compact variant for the toolbar, which must fit narrow/high-DPI windows. */
+QPushButton#compactButton {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+    border: 1px solid #2f3040;
+    border-radius: 9px;
+    padding: 0 10px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+QPushButton#compactButton:hover {
+    background-color: #232330;
+    border-color: #3a3a52;
+}
+
+QPushButton#compactButton:disabled {
+    color: #6c7086;
+    border-color: #2a2a3a;
+}
 QLineEdit#versionsSearch::placeholder { color: #6c7086; }
 
 QFrame#versionsListCard, QFrame#versionDetailCard {
@@ -533,11 +554,12 @@ QFrame#versionsListCard, QFrame#versionDetailCard {
 
 QWidget#versionsListContent { background-color: transparent; }
 
+/* The header sits inside the card, so it only rounds its top corners. */
 QWidget#versionHeaderRow {
     background-color: #232334;
+    border-top-left-radius: 15px;
+    border-top-right-radius: 15px;
     border-bottom: 1px solid #2a2a3a;
-    border-top-left-radius: 16px;
-    border-top-right-radius: 16px;
 }
 
 #versionHeaderCell {
@@ -571,6 +593,13 @@ QFrame#versionRowSelected {
 #versionRowType {
     background-color: transparent;
     color: #89b4fa;
+    font-size: 13px;
+}
+
+/* snapshots / beta / alpha - muted so releases stand out */
+#versionRowTypeAlt {
+    background-color: transparent;
+    color: #7f849c;
     font-size: 13px;
 }
 

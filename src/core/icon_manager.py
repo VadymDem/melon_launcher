@@ -111,6 +111,7 @@ class IconDownloadWorker(QThread):
     
     def __init__(self, icon_manager: IconManager, url: str, size: tuple):
         super().__init__()
+        self.setObjectName(f"IconDownloadWorker-{url}")
         self.icon_manager = icon_manager
         self.url = url
         self.size = size

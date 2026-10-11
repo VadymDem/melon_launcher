@@ -25,6 +25,7 @@ class DownloadWorker(QThread):
         timeout: int = 30
     ):
         super().__init__()
+        self.setObjectName("DownloadWorker")
         self.manifest = manifest
         self.base_path = Path(base_path)
         self.base_url = base_url
