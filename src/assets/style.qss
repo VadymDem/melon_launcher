@@ -513,15 +513,6 @@ QPushButton#filterChip:checked {
     font-weight: 600;
 }
 
-#editionBadge {
-    background-color: #1e1e2e;
-    border: 1px solid #2f3040;
-    border-radius: 10px;
-    color: #cdd6f4;
-    font-size: 12px;
-    font-weight: 600;
-}
-
 QLineEdit#versionsSearch {
     background-color: #1e1e2e;
     border: 1px solid #2f3040;

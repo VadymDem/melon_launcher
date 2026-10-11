@@ -72,6 +72,9 @@ class InstallThread(QThread):
     """Background thread that installs an official Minecraft version."""
 
     progress_changed = pyqtSignal(int, int, str)  # value, maximum, status
+    # Must be declared explicitly: otherwise self.finished resolves to the
+    # built-in QThread.finished() and emitting two arguments raises TypeError.
+    finished = pyqtSignal(bool, str)  # success, message
 
     # The library reports English status strings; map the common ones.
     STATUS_RU = {
@@ -177,9 +180,10 @@ class LaunchThread(QThread):
         try:
             self.progress_changed.emit(0, "Проверка требований...")
             
-            # 1. Ensure Java
+            # 1. Ensure Java - runtimes are shared by every instance, so they
+            # live in the install root and not inside the instance folder.
             self.progress_changed.emit(10, f"Проверка Java {self.java_version}...")
-            java_install = JavaManager(self.game_directory).ensure_java(self.java_version)
+            java_install = JavaManager(self.minecraft_directory).ensure_java(self.java_version)
             if not java_install.is_valid:
                 self.finished.emit(False, f"Java {self.java_version} недоступна: {java_install.error}")
                 return
@@ -277,6 +281,7 @@ class MainWindow(QMainWindow):
         self.install_thread: InstallThread | None = None
         self.delete_thread: DeleteThread | None = None
         self._stats_thread: StatsThread | None = None
+        self._launch_thread: LaunchThread | None = None
 
         self._packs: List = []
 
@@ -927,7 +932,7 @@ class MainWindow(QMainWindow):
             if remove_empty_instance(Path(self.config.install_path), version_id):
                 message += ". Папка сборки удалена"
             elif instance_exists(Path(self.config.install_path), version_id):
-                message += f". Миры и моды сохранены в папке сборки: {version_id}"
+                message += f". Миры и настройки сохранены в папке сборки {version_id}"
         except ValueError:
             pass
 
@@ -1063,9 +1068,11 @@ class MainWindow(QMainWindow):
 
         # Each pack plays in its own folder so worlds and mods never mix.
         pack_id = self.current_manifest.minecraft_version
+        loader = (self.current_manifest.loader.type or "vanilla").lower()
+        is_modded = loader not in ("vanilla", "")
         install_root = Path(self.config.install_path)
         try:
-            instance_dir = ensure_instance_dir(install_root, pack_id)
+            instance_dir = ensure_instance_dir(install_root, pack_id, modded=is_modded)
         except ValueError as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось создать папку сборки: {e}")
             return
@@ -1189,6 +1196,15 @@ class MainWindow(QMainWindow):
             self._stats_thread.wait(2000)
         if self.delete_thread and self.delete_thread.isRunning():
             self.delete_thread.wait(3000)
+        # A launch still in progress is a live QThread too; without this Qt
+        # prints "QThread: Destroyed while thread is still running".
+        # Give it a moment to finish on its own first - it only performs
+        # file and network work - then force it.
+        launch_thread = getattr(self, "_launch_thread", None)
+        if launch_thread is not None and launch_thread.isRunning():
+            if not launch_thread.wait(2000):
+                launch_thread.terminate()
+                launch_thread.wait(2000)
         # The versions page runs its own stats thread; stop it before the
         # window is destroyed, otherwise Qt aborts on a live QThread.
         if hasattr(self, "versions_page"):
@@ -1250,7 +1266,14 @@ class MainWindow(QMainWindow):
     def _open_settings(self):
         dialog = SettingsDialog(self.config, self.auth_manager, self.java_manager, self)
         dialog.microsoft_login_requested.connect(self._start_microsoft_login)
+        dialog.auth_changed.connect(self._on_auth_changed)
         if dialog.exec():
             self._apply_styles()
             self._refresh_packs()
             self._update_profile_widget()
+            self._on_auth_changed()
+
+    def _on_auth_changed(self):
+        """Refresh the sidebar account card after a login or logout."""
+        self._refresh_home_page()
+        self._update_profile_widget()

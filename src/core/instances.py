@@ -13,22 +13,34 @@ from pathlib import Path
 from typing import List
 
 
-# Folders Minecraft expects to be able to write into at runtime.
-INSTANCE_SUBDIRS = [
+# Folders every instance needs: the game writes here on its own.
+BASE_SUBDIRS = [
     "saves",
     "config",
-    "mods",
-    "resourcepacks",
-    "shaderpacks",
     "screenshots",
     "logs",
 ]
+
+# Only meaningful for modded builds. A vanilla version never loads mods, so
+# creating these folders for it would be dead weight.
+MODDED_SUBDIRS = [
+    "mods",
+    "resourcepacks",
+    "shaderpacks",
+]
+
+INSTANCE_SUBDIRS = BASE_SUBDIRS + MODDED_SUBDIRS
 
 # Files that belong to a single instance rather than to the launcher.
 INSTANCE_FILES = ["options.txt", "servers.dat", "usercache.json", "banned-players.json"]
 
 # Folders the game fills on its own - their presence says nothing about usage.
 IGNORED_SUBDIRS = ["logs", "screenshots", "shaderpacks"]
+
+
+def subdirs_for(modded: bool) -> List[str]:
+    """Folders to create for an instance: base ones, plus mod ones if modded."""
+    return INSTANCE_SUBDIRS if modded else BASE_SUBDIRS
 
 
 def safe_folder_name(pack_id: str) -> str:
@@ -63,16 +75,19 @@ def get_instance_dir(install_path: Path, pack_id: str) -> Path:
     return instances_root(install_path) / safe_folder_name(pack_id)
 
 
-def ensure_instance_dir(install_path: Path, pack_id: str) -> Path:
+def ensure_instance_dir(install_path: Path, pack_id: str, modded: bool = False) -> Path:
     """
     Create the instance folder and its standard subfolders if needed.
+
+    ``modded`` adds the mods/resourcepacks/shaderpacks folders; a vanilla
+    version does not get them because it cannot use them.
 
     Returns the instance folder path.
     """
     instance = get_instance_dir(install_path, pack_id)
     instance.mkdir(parents=True, exist_ok=True)
 
-    for name in INSTANCE_SUBDIRS:
+    for name in subdirs_for(modded):
         (instance / name).mkdir(parents=True, exist_ok=True)
 
     return instance

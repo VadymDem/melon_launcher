@@ -28,6 +28,9 @@ GREEN = "#a6e3a1"
 # Chips shown in the toolbar, in mockup order.
 FILTERS = ["Все", "Release", "Snapshot", "Beta", "Alpha"]
 
+# Width of the detail column on the right.
+DETAIL_WIDTH = 320
+
 
 class StatsThread(QThread):
     """Computes the install stats (file count / size) of a single version."""
@@ -58,7 +61,7 @@ class FilterChip(QPushButton):
         self.setObjectName("filterChip")
         self.setCheckable(True)
         self.setFixedHeight(34)
-        self.setMinimumWidth(74)
+        self.setMinimumWidth(54)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
 
@@ -185,7 +188,7 @@ class VersionsPage(QWidget):
 
     def _build_toolbar(self) -> QHBoxLayout:
         row = QHBoxLayout()
-        row.setSpacing(10)
+        row.setSpacing(8)
 
         self.chips = []
         for name in FILTERS:
@@ -195,31 +198,31 @@ class VersionsPage(QWidget):
             row.addWidget(chip)
             self.chips.append(chip)
 
-        row.addStretch()
-
-        edition = QLabel("Java Edition")
-        edition.setObjectName("editionBadge")
-        edition.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        edition.setFixedHeight(34)
-        edition.setMinimumWidth(112)
-        row.addWidget(edition)
-
-        row.addSpacing(10)
+        row.addSpacing(8)
 
         self.search_input = QLineEdit()
         self.search_input.setObjectName("versionsSearch")
         self.search_input.setPlaceholderText("Поиск версии")
         self.search_input.setFixedHeight(34)
-        self.search_input.setMinimumWidth(220)
+        # Shrinkable so the toolbar never pushes the buttons off-screen.
+        self.search_input.setMinimumWidth(110)
+        self.search_input.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.search_input.textChanged.connect(self._set_search)
-        row.addWidget(self.search_input)
+        row.addWidget(self.search_input, 1)
 
         self.refresh_button = QPushButton("Обновить")
         self.refresh_button.setObjectName("secondaryButton")
         self.refresh_button.setFixedHeight(34)
+        # Never squeezed: the label must stay readable, so the search field
+        # gives up space first.
+        self.refresh_button.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
+        )
         self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
-        row.addWidget(self.refresh_button)
+        row.addWidget(self.refresh_button, 0)
 
         return row
 
@@ -276,11 +279,14 @@ class VersionsPage(QWidget):
     def _build_detail(self) -> QFrame:
         card = QFrame()
         card.setObjectName("versionDetailCard")
-        card.setFixedWidth(320)
+        card.setFixedWidth(DETAIL_WIDTH)
+        # Minimum vertically: the card must never be squeezed below its
+        # content, otherwise the buttons start to overlap.
+        card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
 
         layout = QVBoxLayout(card)
         layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(16)
+        layout.setSpacing(14)
 
         header = QHBoxLayout()
         header.setSpacing(14)
@@ -317,8 +323,7 @@ class VersionsPage(QWidget):
         self.row_java = DetailRow("Java")
         self.row_files = DetailRow("Файлов")
         self.row_size = DetailRow("Размер")
-        self.row_disk = DetailRow("На диске")
-        for row in (self.row_java, self.row_files, self.row_size, self.row_disk):
+        for row in (self.row_java, self.row_files, self.row_size):
             layout.addWidget(row)
 
         layout.addSpacing(4)
@@ -341,35 +346,58 @@ class VersionsPage(QWidget):
         self.play_button.clicked.connect(self._on_play_clicked)
         layout.addWidget(self.play_button)
 
+        # Secondary actions are grouped so the primary button reads as separate.
+        # The group is vertically Fixed, otherwise the card squeezes it and the
+        # buttons overlap each other.
+        layout.addSpacing(14)
+
+        secondary = QWidget()
+        secondary.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        secondary_layout = QVBoxLayout(secondary)
+        secondary_layout.setContentsMargins(0, 0, 0, 0)
+        secondary_layout.setSpacing(10)
+
         self.options_button = QPushButton("Параметры запуска")
         self.options_button.setObjectName("secondaryButton")
         self.options_button.setMinimumHeight(46)
         self.options_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.options_button.clicked.connect(self.launch_options_requested.emit)
-        layout.addWidget(self.options_button)
+        secondary_layout.addWidget(self.options_button)
 
         self.folder_button = QPushButton("Открыть папку")
         self.folder_button.setObjectName("secondaryButton")
-        self.folder_button.setMinimumHeight(42)
+        self.folder_button.setMinimumHeight(46)
         self.folder_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.folder_button.setToolTip(
-            "Миры, моды и настройки этой версии"
-        )
+        self.folder_button.setToolTip("Миры и настройки этой версии")
         self.folder_button.clicked.connect(self._on_folder_clicked)
         self.folder_button.setEnabled(False)
-        layout.addWidget(self.folder_button)
+        secondary_layout.addWidget(self.folder_button)
 
         self.delete_button = QPushButton("Удалить версию")
         self.delete_button.setObjectName("dangerButton")
-        self.delete_button.setMinimumHeight(42)
+        self.delete_button.setMinimumHeight(46)
         self.delete_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.delete_button.clicked.connect(self._on_delete_clicked)
         self.delete_button.setVisible(False)
-        layout.addWidget(self.delete_button)
+        secondary_layout.addWidget(self.delete_button)
+
+        layout.addWidget(secondary)
 
         layout.addStretch()
         self._set_detail_enabled(False)
-        return card
+
+        # On short windows the card would otherwise be cut off, so its content
+        # lives in a scroll area.
+        scroll = QScrollArea()
+        scroll.setObjectName("detailScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Without this the parent layout squeezes the column and the card gets
+        # cut off, because its 320 px no longer fit into the viewport.
+        scroll.setMinimumWidth(DETAIL_WIDTH + 12)
+        scroll.setWidget(card)
+        return scroll
 
     # ---------- data ----------
 
@@ -465,8 +493,8 @@ class VersionsPage(QWidget):
         self.row_size.set_value("…")
         self.delete_button.setVisible(installed)
 
-        if not self.profile_input.text().strip():
-            self.profile_input.setText(f"Minecraft {version}")
+        # Every version gets its own profile name.
+        self.profile_input.setText(f"Minecraft {version}")
 
         self._set_detail_enabled(True)
         self.play_button.setText("Играть" if installed else "Скачать и играть")

@@ -616,6 +616,8 @@ class SettingsDialog(QDialog):
             self.config.auth_type = "offline"
             self.config.save()
             self._update_session_info()
+            # Let the main window refresh the sidebar account card right away.
+            self.auth_changed.emit()
             QMessageBox.information(self, "Успех", f"Вход выполнен как {profile.username}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
@@ -626,6 +628,7 @@ class SettingsDialog(QDialog):
         self.config.username = "Player"
         self.config.save()
         self._update_session_info()
+        self.auth_changed.emit()
         QMessageBox.information(self, "Выход", "Вы вышли из аккаунта")
 
     def _save_and_accept(self):
@@ -650,3 +653,6 @@ class SettingsDialog(QDialog):
     # Signal for Microsoft login request
     from PyQt6.QtCore import pyqtSignal
     microsoft_login_requested = pyqtSignal()
+    # Emitted when the account changes (offline login / logout) so the main
+    # window can refresh the sidebar without closing this dialog.
+    auth_changed = pyqtSignal()
