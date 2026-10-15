@@ -14,6 +14,7 @@ from ui.home_page import HomePage
 from ui.console_page import ConsolePage
 from ui.placeholder_page import PlaceholderPage
 from ui.versions_page import VersionsPage
+from ui.builds_page import BuildsPage
 from ui.profile_widget import ProfileWidget
 from ui.build_info_widget import BuildInfoWidget  # noqa: F401  (kept for settings dialog)
 from utils.config import Config
@@ -296,7 +297,7 @@ class MainWindow(QMainWindow):
         self.config = config
         self.setWindowTitle("Melon Launcher")
         self.setMinimumSize(1000, 650)
-        self.resize(1200, 720)
+        self.resize(1320, 760)
 
         # Initialize IconManager
         self.icon_manager = IconManager(Path(config.install_path) / "icons")
@@ -443,7 +444,8 @@ class MainWindow(QMainWindow):
         self.versions_page.refresh_requested.connect(self._on_refresh_versions)
         self.stack.addWidget(self.versions_page)
 
-        self.stack.addWidget(PlaceholderPage("Сборки", "builds"))
+        self.builds_page = BuildsPage(self.config)
+        self.stack.addWidget(self.builds_page)
         self.stack.addWidget(PlaceholderPage("Миры", "worlds"))
         self.stack.addWidget(PlaceholderPage("Серверы", "servers"))
 
@@ -465,6 +467,10 @@ class MainWindow(QMainWindow):
         self.play_button = self.home_page.play_button
         self.profile_combo = self.home_page.version_combo
         self.profile_widget = ProfileWidget(self.config, self.auth_manager)
+        # The profile widget changes auth state on its own (offline login,
+        # logout, mode switch); keep the sidebar card in sync.
+        self.profile_widget.auth_changed.connect(self._on_auth_changed)
+        self.profile_widget.microsoft_login_requested.connect(self._start_microsoft_login)
         self.main_splitter = QSplitter(Qt.Orientation.Vertical)
 
     def _create_header(self):
@@ -1307,6 +1313,9 @@ class MainWindow(QMainWindow):
         # window is destroyed, otherwise Qt aborts on a live QThread.
         if hasattr(self, "versions_page"):
             self.versions_page.shutdown()
+        # The builds page runs Modrinth request threads.
+        if hasattr(self, "builds_page"):
+            self.builds_page.shutdown()
         # Stop auth callback server
         if hasattr(self, 'auth_manager') and self.auth_manager:
             self.auth_manager.stop_callback_server()
@@ -1345,7 +1354,7 @@ class MainWindow(QMainWindow):
             self.config.auth_type = "microsoft"
             self.config.username = profile.username
             self.config.save()
-            self._update_profile_widget()
+            self._on_auth_changed()
             self._append_log(f"[AUTH] Вход выполнен: {profile.username}")
             QMessageBox.information(self, "Успех", f"Вход выполнен: {profile.username}")
         else:

@@ -2,7 +2,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QSizePolicy, QMessageBox, QInputDialog, QLineEdit, QComboBox
 )
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QPixmap, QPainter, QPainterPath, QColor, QFont
 
 from utils.config import Config
@@ -10,6 +10,13 @@ from core import AuthManager, AuthProfile, OfflineAuthError, MicrosoftAuthError
 
 
 class ProfileWidget(QWidget):
+    # Emitted whenever the auth state changes (offline login, logout, mode
+    # switch) so the main window can refresh the sidebar account card, which
+    # this widget does not own.
+    auth_changed = pyqtSignal()
+    # Request to start the Microsoft OAuth flow - handled by MainWindow.
+    microsoft_login_requested = pyqtSignal()
+
     def __init__(self, config: Config, auth_manager: AuthManager):
         super().__init__()
         self.config = config
@@ -190,23 +197,35 @@ class ProfileWidget(QWidget):
             current = "Microsoft" if profile.auth_type == "microsoft" else "Offline"
             if mode == current:
                 return
-            self.auth_manager.logout()
+            self._logout(reset_username=True)
             self.config.auth_type = mode.lower()
             self.config.save()
-            self._update_profile()
 
         if mode == "Offline":
             self._start_offline_login()
         else:
             self._start_microsoft_login()
 
+    def _logout(self, reset_username: bool = True):
+        """Clear the session and refresh every account view.
+
+        Sets the offline username back to the default so the sidebar does not
+        keep showing the name of the account that just logged out.
+        """
+        self.auth_manager.logout()
+        if reset_username:
+            self.config.username = "Player"
+            self.config.auth_type = "offline"
+            self.config.save()
+        self._update_profile()
+        self.auth_changed.emit()
+
     def _on_auth_clicked(self):
         profile = self.auth_manager.get_profile()
         
         if profile and profile.auth_type == "microsoft":
             # Logout
-            self.auth_manager.logout()
-            self._update_profile()
+            self._logout()
             QMessageBox.information(self, "Выход", "Вы вышли из аккаунта Microsoft")
         elif profile and profile.auth_type == "offline":
             # Switch to Microsoft login
@@ -265,6 +284,7 @@ class ProfileWidget(QWidget):
                 self.config.auth_type = "offline"
                 self.config.save()
                 self._update_profile()
+                self.auth_changed.emit()
                 QMessageBox.information(self, "Успех", f"Вход выполнен как {profile.username}")
             except OfflineAuthError as e:
                 QMessageBox.critical(self, "Ошибка", str(e))
@@ -277,7 +297,3 @@ class ProfileWidget(QWidget):
 
     def refresh(self):
         self._update_profile()
-
-    # Custom signal for Microsoft login request
-    from PyQt6.QtCore import pyqtSignal
-    microsoft_login_requested = pyqtSignal()

@@ -2,7 +2,7 @@ import requests
 from pathlib import Path
 from typing import Optional, Callable
 from PyQt6.QtGui import QPixmap, QImage
-from PyQt6.QtCore import QThread, pyqtSignal, QByteArray
+from PyQt6.QtCore import QThread, pyqtSignal, QByteArray, Qt
 import hashlib
 
 
@@ -86,8 +86,8 @@ class IconManager:
             # Scale maintaining aspect ratio
             scaled = pixmap.scaled(
                 size[0], size[1],
-                aspectRatioMode=1,  # Qt.KeepAspectRatio
-                transformMode=1  # Qt.SmoothTransformation
+                aspectRatioMode=Qt.AspectRatioMode.KeepAspectRatio,
+                transformMode=Qt.TransformationMode.SmoothTransformation,
             )
             
             self._memory_cache[cache_key] = scaled

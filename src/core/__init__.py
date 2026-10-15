@@ -11,6 +11,20 @@ from core.auth import AuthManager, AuthProfile, OfflineAuthError, MicrosoftAuthE
 from core.java_manager import JavaManager, JavaInstallation
 from core.jvm_config import JVMConfigBuilder, JVMConfig, parse_jvm_args, format_jvm_args
 from core.modrinth_api import ModrinthAPI, ModrinthProject, ModrinthVersion, ModrinthFile, ModrinthManifestBuilder, CurseForgeAPI
+from core.modrinth_catalog import (
+    ModrinthCatalogClient,
+    ModpackTags,
+    ModpackHit,
+    ModpackDetail,
+    ModpackVersionInfo,
+    SearchResult,
+    CatalogError,
+    SORT_OPTIONS,
+    KNOWN_LOADERS,
+    LOADER_LABELS,
+    format_downloads,
+)
+from core.curseforge_catalog import CurseForgeCatalogClient
 from core.launch_manager import LaunchManager, LaunchConfig, LaunchResult, GameProcessHandler, LaunchController
 from core.icon_manager import IconManager, IconDownloadWorker, BuildIconWidget, create_placeholder_icon
 from core.builtin_manifests import (
@@ -76,6 +90,18 @@ __all__ = [
     "ModrinthFile",
     "ModrinthManifestBuilder",
     "CurseForgeAPI",
+    "ModrinthCatalogClient",
+    "CurseForgeCatalogClient",
+    "ModpackTags",
+    "ModpackHit",
+    "ModpackDetail",
+    "ModpackVersionInfo",
+    "SearchResult",
+    "CatalogError",
+    "SORT_OPTIONS",
+    "KNOWN_LOADERS",
+    "LOADER_LABELS",
+    "format_downloads",
     "LaunchManager",
     "LaunchConfig",
     "LaunchResult",
